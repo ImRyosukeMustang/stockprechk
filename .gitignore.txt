@@ -1,0 +1,25 @@
+# Secrets
+.env
+*.env
+
+# Local database
+*.db
+*.db-journal
+
+# Trained models
+models/
+*.joblib
+
+# Backtest reports
+backtests/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+
+# OS
+.DS_Store
+Thumbs.db
