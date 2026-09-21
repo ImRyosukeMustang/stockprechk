@@ -1,0 +1,23 @@
+# --- Phase 1 (data flow) ---
+yfinance
+feedparser
+requests
+praw
+python-dotenv
+
+# --- Phase 2 (sentiment + technical) ---
+transformers
+torch
+ta
+
+# --- Phase 3 (the brain) ---
+xgboost
+scikit-learn
+pandas
+numpy
+
+# --- Phase 4 (the product) ---
+openai
+apscheduler
+streamlit
+plotly
