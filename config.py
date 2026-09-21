@@ -38,16 +38,29 @@ BASE_DIR = Path(__file__).resolve().parent
 DRY_RUN: bool = True
 
 # ---------------------------------------------------------------------------
-# API keys — read from environment. All are optional at Day 0; individual
-# modules are responsible for checking whether a key they need is present
-# and failing gracefully (skip that data source, log a warning) rather than
-# crashing the whole pipeline.
+# API keys — read from Streamlit secrets (cloud) OR environment (local).
+# All are optional at Day 0; individual modules are responsible for checking
+# whether a key they need is present and failing gracefully (skip that data
+# source, log a warning) rather than crashing the whole pipeline.
 # ---------------------------------------------------------------------------
-OPENAI_API_KEY: str | None = os.environ.get("OPENAI_API_KEY")
-NEWSAPI_KEY: str | None = os.environ.get("NEWSAPI_KEY")
-REDDIT_CLIENT_ID: str | None = os.environ.get("REDDIT_CLIENT_ID")
-REDDIT_CLIENT_SECRET: str | None = os.environ.get("REDDIT_CLIENT_SECRET")
-REDDIT_USER_AGENT: str = os.environ.get("REDDIT_USER_AGENT", "StockOracle/0.1")
+def _get_secret(key: str, default: str | None = None) -> str | None:
+    """Read a secret from Streamlit's secrets system if running under
+    Streamlit Cloud, otherwise from os.environ (local development)."""
+    try:
+        import streamlit as st
+        if key in st.secrets:
+            return str(st.secrets[key])
+    except Exception:
+        # Not running under Streamlit, or secrets not configured
+        pass
+    return os.environ.get(key, default)
+
+
+OPENAI_API_KEY: str | None = _get_secret("OPENAI_API_KEY")
+NEWSAPI_KEY: str | None = _get_secret("NEWSAPI_KEY")
+REDDIT_CLIENT_ID: str | None = _get_secret("REDDIT_CLIENT_ID")
+REDDIT_CLIENT_SECRET: str | None = _get_secret("REDDIT_CLIENT_SECRET")
+REDDIT_USER_AGENT: str = _get_secret("REDDIT_USER_AGENT", "StockOracle/0.1")
 
 # ---------------------------------------------------------------------------
 # LLM model selection
