@@ -1,0 +1,241 @@
+{
+  "n_trades": 28,
+  "win_rate": 0.5357142857142857,
+  "avg_trade_return_pct": 3.3748461924387363,
+  "total_return_pct": 116.12359062376818,
+  "buy_hold_return_pct": 674.8622867930972,
+  "max_drawdown_pct": -0.3174825614097002,
+  "sharpe_ratio": 0.6845386542606877,
+  "ticker": "NVDA",
+  "horizon_days": 5,
+  "backend": "xgboost",
+  "n_folds": 60,
+  "n_oos_days": 1190,
+  "run_at": "2026-09-22T16:30:13.294310+00:00",
+  "trades": [
+    {
+      "entry_date": "2022-05-04",
+      "exit_date": "2022-05-06",
+      "entry_price": 19.861285631598527,
+      "exit_price": 18.254110398289576,
+      "return_pct": -8.09199999999999,
+      "exit_reason": "stop_loss"
+    },
+    {
+      "entry_date": "2022-05-09",
+      "exit_date": "2022-05-11",
+      "entry_price": 17.978133585622434,
+      "exit_price": 16.523343015873866,
+      "return_pct": -8.092,
+      "exit_reason": "stop_loss"
+    },
+    {
+      "entry_date": "2022-05-18",
+      "exit_date": "2022-05-20",
+      "entry_price": 17.650152793059632,
+      "exit_price": 16.221902429045247,
+      "return_pct": -8.091999999999997,
+      "exit_reason": "stop_loss"
+    },
+    {
+      "entry_date": "2022-05-23",
+      "exit_date": "2022-05-27",
+      "entry_price": 16.223584472697066,
+      "exit_price": 18.638465021458025,
+      "return_pct": 14.885000000000002,
+      "exit_reason": "take_profit"
+    },
+    {
+      "entry_date": "2022-09-26",
+      "exit_date": "2022-10-10",
+      "entry_price": 12.458636732763216,
+      "exit_price": 11.450483848348016,
+      "return_pct": -8.092000000000002,
+      "exit_reason": "stop_loss"
+    },
+    {
+      "entry_date": "2022-10-11",
+      "exit_date": "2022-10-26",
+      "entry_price": 11.531047953693557,
+      "exit_price": 13.247444441600843,
+      "return_pct": 14.884999999999998,
+      "exit_reason": "take_profit"
+    },
+    {
+      "entry_date": "2022-11-02",
+      "exit_date": "2022-11-11",
+      "entry_price": 13.81411760887613,
+      "exit_price": 15.870349014957341,
+      "return_pct": 14.884999999999998,
+      "exit_reason": "take_profit"
+    },
+    {
+      "entry_date": "2022-12-15",
+      "exit_date": "2022-12-22",
+      "entry_price": 17.10595235135434,
+      "exit_price": 15.721738687082748,
+      "return_pct": -8.09199999999999,
+      "exit_reason": "stop_loss"
+    },
+    {
+      "entry_date": "2023-01-12",
+      "exit_date": "2023-01-23",
+      "entry_price": 16.062398782453734,
+      "exit_price": 18.45328684122197,
+      "return_pct": 14.88499999999999,
+      "exit_reason": "take_profit"
+    },
+    {
+      "entry_date": "2023-03-21",
+      "exit_date": "2023-05-17",
+      "entry_price": 26.123292831672753,
+      "exit_price": 30.01174496966724,
+      "return_pct": 14.884999999999996,
+      "exit_reason": "take_profit"
+    },
+    {
+      "entry_date": "2023-05-22",
+      "exit_date": "2023-05-25",
+      "entry_price": 30.834062235768535,
+      "exit_price": 35.42371239956268,
+      "return_pct": 14.885000000000002,
+      "exit_reason": "take_profit"
+    },
+    {
+      "entry_date": "2023-07-21",
+      "exit_date": "2023-07-28",
+      "entry_price": 45.69354639048111,
+      "exit_price": 46.56432406579295,
+      "return_pct": 1.9056907246167327,
+      "exit_reason": "sell_signal"
+    },
+    {
+      "entry_date": "2023-08-23",
+      "exit_date": "2023-09-18",
+      "entry_price": 45.7713864876179,
+      "exit_price": 42.06756589303986,
+      "return_pct": -8.091999999999999,
+      "exit_reason": "stop_loss"
+    },
+    {
+      "entry_date": "2023-10-03",
+      "exit_date": "2023-10-20",
+      "entry_price": 44.71924754071496,
+      "exit_price": 41.100566029720305,
+      "return_pct": -8.092,
+      "exit_reason": "stop_loss"
+    },
+    {
+      "entry_date": "2023-11-06",
+      "exit_date": "2024-01-08",
+      "entry_price": 45.195299560159995,
+      "exit_price": 51.922619899689806,
+      "return_pct": 14.88499999999999,
+      "exit_reason": "take_profit"
+    },
+    {
+      "entry_date": "2024-02-28",
+      "exit_date": "2024-03-06",
+      "entry_price": 77.47307353631527,
+      "exit_price": 89.0049405321958,
+      "return_pct": 14.885000000000009,
+      "exit_reason": "take_profit"
+    },
+    {
+      "entry_date": "2024-03-07",
+      "exit_date": "2024-04-09",
+      "entry_price": 89.9915570521279,
+      "exit_price": 82.70944025546972,
+      "return_pct": -8.091999999999997,
+      "exit_reason": "stop_loss"
+    },
+    {
+      "entry_date": "2024-05-01",
+      "exit_date": "2024-05-23",
+      "entry_price": 84.91994283487956,
+      "exit_price": 97.56027632585138,
+      "return_pct": 14.884999999999987,
+      "exit_reason": "take_profit"
+    },
+    {
+      "entry_date": "2024-05-29",
+      "exit_date": "2024-06-14",
+      "entry_price": 112.84130133871423,
+      "exit_price": 129.63772904298182,
+      "return_pct": 14.884999999999977,
+      "exit_reason": "take_profit"
+    },
+    {
+      "entry_date": "2024-06-24",
+      "exit_date": "2024-07-24",
+      "entry_price": 123.02256664662475,
+      "exit_price": 113.06758055357989,
+      "return_pct": -8.091999999999992,
+      "exit_reason": "stop_loss"
+    },
+    {
+      "entry_date": "2024-08-22",
+      "exit_date": "2024-08-29",
+      "entry_price": 129.79063385468447,
+      "exit_price": 119.28797576316342,
+      "return_pct": -8.091999999999992,
+      "exit_reason": "stop_loss"
+    },
+    {
+      "entry_date": "2024-09-16",
+      "exit_date": "2024-10-09",
+      "entry_price": 116.59392871120743,
+      "exit_price": 133.94893499987063,
+      "return_pct": 14.884999999999982,
+      "exit_reason": "take_profit"
+    },
+    {
+      "entry_date": "2024-12-27",
+      "exit_date": "2025-01-27",
+      "entry_price": 138.32693762507608,
+      "exit_price": 127.13352183245493,
+      "return_pct": -8.091999999999997,
+      "exit_reason": "stop_loss"
+    },
+    {
+      "entry_date": "2025-02-11",
+      "exit_date": "2025-02-27",
+      "entry_price": 132.366557326794,
+      "exit_price": 121.65545550790983,
+      "return_pct": -8.092000000000002,
+      "exit_reason": "stop_loss"
+    },
+    {
+      "entry_date": "2025-03-18",
+      "exit_date": "2025-03-31",
+      "entry_price": 117.82086333429854,
+      "exit_price": 108.2867990732871,
+      "return_pct": -8.091999999999999,
+      "exit_reason": "stop_loss"
+    },
+    {
+      "entry_date": "2025-05-19",
+      "exit_date": "2025-06-12",
+      "entry_price": 132.18902190685353,
+      "exit_price": 141.9893113726396,
+      "return_pct": 7.413845207729743,
+      "exit_reason": "sell_signal"
+    },
+    {
+      "entry_date": "2025-07-01",
+      "exit_date": "2025-07-31",
+      "entry_price": 156.06357132741192,
+      "exit_price": 179.29363391949718,
+      "return_pct": 14.884999999999998,
+      "exit_reason": "take_profit"
+    },
+    {
+      "entry_date": "2026-07-09",
+      "exit_date": "2026-09-22",
+      "entry_price": 204.4357063343882,
+      "exit_price": 228.46131243896485,
+      "return_pct": 11.752157455938173,
+      "exit_reason": "end_of_backtest"
+    }
+  ]
+}
