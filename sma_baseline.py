@@ -62,11 +62,14 @@ def _sharpe_ratio(daily_returns: pd.Series) -> float:
     return float(np.sqrt(TRADING_DAYS_PER_YEAR) * mean / std)
 
 
-def _run_single_ticker(ticker: str, df: pd.DataFrame) -> dict | None:
+def _run_single_ticker(ticker: str, raw_rows) -> dict | None:
     """Simulate the SMA 50/200 crossover strategy for one ticker's OHLCV history."""
-    if df is None or df.empty:
+    if raw_rows is None or len(raw_rows) == 0:
         logger.warning("No price history for %s, skipping.", ticker)
         return None
+
+    # DB helper returns a list of sqlite3.Row — convert to DataFrame
+    df = pd.DataFrame([dict(r) for r in raw_rows])
 
     df = df.sort_values("date").reset_index(drop=True).copy()
 
