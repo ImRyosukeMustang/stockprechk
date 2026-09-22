@@ -110,7 +110,7 @@ TRANSACTION_COST_PCT: float = 0.001  # 10 bps per trade side (commission + slipp
 # ---------------------------------------------------------------------------
 # Data-fetch settings
 # ---------------------------------------------------------------------------
-PRICE_HISTORY_PERIOD: str = "1y"     # yfinance period string
+PRICE_HISTORY_PERIOD: str = "5y"     # yfinance period string
 PRICE_HISTORY_INTERVAL: str = "1d"   # yfinance interval string
 NEWS_LOOKBACK_HOURS: int = 48
 REDDIT_SUBREDDITS: list[str] = ["stocks", "wallstreetbets", "investing"]
