@@ -16,6 +16,7 @@ Safe to call repeatedly - INSERT OR REPLACE on (ticker, interval, timestamp).
 
 from __future__ import annotations
 
+import os
 import sqlite3
 from datetime import datetime, timedelta, timezone
 from typing import Literal
@@ -29,9 +30,13 @@ log = config.get_logger(__name__)
 try:
     from alpaca_keys import ALPACA_API_KEY, ALPACA_SECRET_KEY
 except ImportError:
-    ALPACA_API_KEY = None
-    ALPACA_SECRET_KEY = None
-    log.warning("alpaca_keys.py not found - Alpaca fetcher will be skipped.")
+    # Fallback to environment variables (used in GitHub Actions).
+    ALPACA_API_KEY = os.environ.get("ALPACA_API_KEY")
+    ALPACA_SECRET_KEY = os.environ.get("ALPACA_SECRET_KEY")
+    if not ALPACA_API_KEY:
+        log.warning(
+            "Neither alpaca_keys.py nor ALPACA_API_KEY env var found - Alpaca fetcher will be skipped."
+        )
 
 # Map our interval strings to Alpaca's timeframe units
 _INTERVAL_MAP = {
