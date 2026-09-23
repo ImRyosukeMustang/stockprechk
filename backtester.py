@@ -468,10 +468,190 @@ def backtest_watchlist(conn: sqlite3.Connection, tickers: list[str] | None = Non
     return results
  
  
+def run_vol_targeted_backtest(conn: sqlite3.Connection, ticker: str) -> dict | None:
+    """Backtest the SMA(50/200) plus volatility-targeting strategy."""
+    import pandas as pd
+    import vol_target
+
+    rows = database.get_price_history(conn, ticker)
+    if not rows or len(rows) < 200:
+        log.warning("Not enough history for SMA+vol backtest on %s.", ticker)
+        return None
+
+    df = pd.DataFrame([dict(row) for row in rows])
+    df["date"] = pd.to_datetime(df["date"])
+    df = df.sort_values("date").reset_index(drop=True)
+    df["sma50"] = df["close"].rolling(window=50, min_periods=50).mean()
+    df["sma200"] = df["close"].rolling(window=200, min_periods=200).mean()
+    tradeable = df[df["sma200"].notna()].reset_index(drop=True)
+    if len(tradeable) < 2:
+        log.warning("Not enough tradeable bars for %s (need >= 2 after SMA200).", ticker)
+        return None
+
+    cost = config.TRANSACTION_COST_PCT
+    target_vol = config.TARGET_VOL
+    lookback = config.VOL_LOOKBACK_DAYS
+    min_rebalance = config.MIN_REBALANCE_DELTA
+    capital = 1.0
+    current_position = 0.0
+    entry_price = None
+    entry_date = None
+    trades: list[dict] = []
+    equity_curve: list[dict] = []
+    n_rebalances = 0
+    invested_days = 0
+
+    for i, row in tradeable.iterrows():
+        if current_position > 0 and entry_price is not None:
+            unrealized = current_position * (row["close"] - entry_price) / entry_price
+            equity = capital * (1 + unrealized)
+        else:
+            equity = capital
+        equity_curve.append({"date": row["date"].strftime("%Y-%m-%d"), "equity": equity})
+        if current_position > 0:
+            invested_days += 1
+
+        if row["sma50"] > row["sma200"]:
+            closes_up_to_now = tradeable["close"].iloc[: i + 1]
+            target_position = vol_target.compute_position_size(
+                closes_up_to_now, target_vol=target_vol, lookback=lookback
+            )
+        else:
+            target_position = 0.0
+
+        if abs(target_position - current_position) < min_rebalance or i + 1 >= len(tradeable):
+            continue
+
+        next_bar = tradeable.iloc[i + 1]
+        next_open = next_bar["open"]
+        next_date = next_bar["date"].strftime("%Y-%m-%d")
+        if current_position > 0 and entry_price is not None:
+            exit_price = next_open * (1 - cost)
+            realized = current_position * (exit_price - entry_price) / entry_price
+            capital *= 1 + realized
+            trades.append({
+                "entry_date": entry_date,
+                "exit_date": next_date,
+                "entry_price": entry_price,
+                "exit_price": exit_price,
+                "position_size": current_position,
+                "return_pct": realized * 100,
+            })
+
+        if target_position > 0:
+            entry_price = next_open * (1 + cost)
+            entry_date = next_date
+            current_position = target_position
+        else:
+            entry_price = None
+            entry_date = None
+            current_position = 0.0
+        n_rebalances += 1
+
+    if current_position > 0 and entry_price is not None:
+        last_row = tradeable.iloc[-1]
+        exit_price = last_row["close"] * (1 - cost)
+        realized = current_position * (exit_price - entry_price) / entry_price
+        capital *= 1 + realized
+        trades.append({
+            "entry_date": entry_date,
+            "exit_date": last_row["date"].strftime("%Y-%m-%d"),
+            "entry_price": entry_price,
+            "exit_price": exit_price,
+            "position_size": current_position,
+            "return_pct": realized * 100,
+        })
+
+    n_trades = len(trades)
+    win_rate = sum(trade["return_pct"] > 0 for trade in trades) / n_trades if n_trades else 0.0
+    total_return_pct = (capital - 1.0) * 100
+    first_close = tradeable.iloc[0]["close"]
+    last_close = tradeable.iloc[-1]["close"]
+    buy_hold_return_pct = (last_close - first_close) / first_close * 100
+
+    peak = -float("inf")
+    max_dd = 0.0
+    for point in equity_curve:
+        peak = max(peak, point["equity"])
+        drawdown = (point["equity"] - peak) / peak if peak > 0 else 0
+        max_dd = min(max_dd, drawdown)
+
+    sharpe = None
+    if len(equity_curve) > 2:
+        daily_returns = [
+            (current["equity"] - previous["equity"]) / previous["equity"]
+            for previous, current in zip(equity_curve, equity_curve[1:])
+            if previous["equity"] > 0
+        ]
+        if daily_returns:
+            mean_return = sum(daily_returns) / len(daily_returns)
+            variance = sum((value - mean_return) ** 2 for value in daily_returns) / len(daily_returns)
+            std_return = variance ** 0.5
+            if std_return > 0:
+                sharpe = mean_return / std_return * (252 ** 0.5)
+
+    exposure_pct = invested_days / len(tradeable) * 100 if len(tradeable) else 0.0
+    metrics = {
+        "ticker": ticker,
+        "n_trades": n_trades,
+        "win_rate": win_rate,
+        "total_return_pct": total_return_pct,
+        "buy_hold_return_pct": buy_hold_return_pct,
+        "max_drawdown_pct": max_dd,
+        "sharpe_ratio": sharpe,
+        "exposure_pct": exposure_pct,
+        "n_rebalances": n_rebalances,
+    }
+
+    database.insert_backtest_result(conn, {
+        "ticker": ticker,
+        "model_name": f"{ticker}_sma_vol",
+        "start_date": tradeable.iloc[0]["date"].strftime("%Y-%m-%d"),
+        "end_date": tradeable.iloc[-1]["date"].strftime("%Y-%m-%d"),
+        "train_window_days": 0,
+        "test_window_days": len(tradeable),
+        "transaction_cost_pct": cost,
+        "num_trades": n_trades,
+        "win_rate": win_rate,
+        "strategy_return_pct": total_return_pct,
+        "benchmark_return_pct": buy_hold_return_pct,
+        "max_drawdown_pct": max_dd,
+        "sharpe_ratio": sharpe,
+        "detail_json": json.dumps({"exposure_pct": exposure_pct, "n_rebalances": n_rebalances}),
+    })
+    log.info(
+        "%s SMA+Vol backtest: %d trades, %d rebalances, win_rate=%.1f%%, return=%.1f%%, B&H=%.1f%%, max_dd=%.1f%%, exposure=%.1f%%",
+        ticker, n_trades, n_rebalances, win_rate * 100, total_return_pct,
+        buy_hold_return_pct, max_dd * 100, exposure_pct,
+    )
+    return metrics
+
+
+def backtest_vol_targeted_watchlist(
+    conn: sqlite3.Connection, tickers: list[str] | None = None
+) -> dict[str, dict | None]:
+    """Run the volatility-targeted backtest for every ticker."""
+    tickers = tickers or config.WATCHLIST
+    results: dict[str, dict | None] = {}
+    for ticker in tickers:
+        try:
+            results[ticker] = run_vol_targeted_backtest(conn, ticker)
+        except Exception as exc:
+            log.error("Unexpected error in SMA+vol backtest for %s: %s", ticker, exc)
+            results[ticker] = None
+    return results
+
+
 if __name__ == "__main__":
     database.init_db()
     with database.get_connection() as conn:
-        summary = backtest_watchlist(conn)
-        log.info("=== Backtest summary ===")
-        for ticker, metrics in summary.items():
+        log.info("=== Running ML walk-forward backtest ===")
+        ml_summary = backtest_watchlist(conn)
+        log.info("=== Running SMA + Volatility-Targeted backtest ===")
+        vt_summary = backtest_vol_targeted_watchlist(conn)
+        log.info("=== ML Backtest summary ===")
+        for ticker, metrics in ml_summary.items():
+            log.info("%s: %s", ticker, metrics)
+        log.info("=== SMA+Vol Backtest summary ===")
+        for ticker, metrics in vt_summary.items():
             log.info("%s: %s", ticker, metrics)

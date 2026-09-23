@@ -1,0 +1,187 @@
+{
+  "AAPL": {
+    "ticker": "AAPL",
+    "strategy": "SMA_50_200_CROSSOVER",
+    "start_date": "2022-07-08",
+    "end_date": "2026-09-23",
+    "n_bars": 1057,
+    "n_trades": 4,
+    "win_rate": 0.5,
+    "total_return_pct": 23.58640132352847,
+    "buy_hold_return_pct": 134.27020599162844,
+    "max_drawdown_pct": -28.131295175502498,
+    "sharpe_ratio": 0.35611103150619033,
+    "exposure_pct": 67.73888363292336,
+    "trades": [
+      {
+        "entry_date": "2022-09-27",
+        "exit_date": "2022-10-10",
+        "entry_price": 149.96280452435582,
+        "exit_price": 137.59135111999512,
+        "return_pct": -8.249681275033382
+      },
+      {
+        "entry_date": "2023-03-23",
+        "exit_date": "2024-03-15",
+        "entry_price": 156.43925851690662,
+        "exit_price": 169.15475404410324,
+        "return_pct": 8.128071973584841
+      },
+      {
+        "entry_date": "2024-06-14",
+        "exit_date": "2025-04-08",
+        "entry_price": 212.04258654252837,
+        "exit_price": 185.3730944553552,
+        "return_pct": -12.577422546118683
+      },
+      {
+        "entry_date": "2025-09-16",
+        "exit_date": "2026-09-23 (forced close, end of window)",
+        "entry_price": 236.5433896192102,
+        "exit_price": 337.06359997558593,
+        "return_pct": 42.49546373635473
+      }
+    ]
+  },
+  "MSFT": {
+    "ticker": "MSFT",
+    "strategy": "SMA_50_200_CROSSOVER",
+    "start_date": "2022-07-08",
+    "end_date": "2026-09-23",
+    "n_bars": 1057,
+    "n_trades": 4,
+    "win_rate": 0.25,
+    "total_return_pct": 30.018056115761183,
+    "buy_hold_return_pct": 93.16683478977056,
+    "max_drawdown_pct": -25.536705445866758,
+    "sharpe_ratio": 0.4637815144103773,
+    "exposure_pct": 61.68401135288553,
+    "trades": [
+      {
+        "entry_date": "2023-03-21",
+        "exit_date": "2024-12-02",
+        "entry_price": 267.70454076485663,
+        "exit_price": 415.4289300159595,
+        "return_pct": 55.181876567741675
+      },
+      {
+        "entry_date": "2024-12-12",
+        "exit_date": "2025-02-27",
+        "entry_price": 443.45366935749234,
+        "exit_price": 396.21749207496464,
+        "return_pct": -10.651885539918272
+      },
+      {
+        "entry_date": "2025-06-10",
+        "exit_date": "2026-01-23",
+        "entry_price": 467.0443793743852,
+        "exit_price": 448.57229798304,
+        "return_pct": -3.955101957567474
+      },
+      {
+        "entry_date": "2026-08-31",
+        "exit_date": "2026-09-23 (forced close, end of window)",
+        "entry_price": 510.89038488769523,
+        "exit_price": 498.8048950195313,
+        "return_pct": -2.3655739519976704
+      }
+    ]
+  },
+  "NVDA": {
+    "ticker": "NVDA",
+    "strategy": "SMA_50_200_CROSSOVER",
+    "start_date": "2022-07-08",
+    "end_date": "2026-09-23",
+    "n_bars": 1057,
+    "n_trades": 2,
+    "win_rate": 1.0,
+    "total_return_pct": 778.3336591461294,
+    "buy_hold_return_pct": 1327.3125791240102,
+    "max_drawdown_pct": -28.40796100378479,
+    "sharpe_ratio": 1.4348977708209247,
+    "exposure_pct": 80.60548722800378,
+    "trades": [
+      {
+        "entry_date": "2023-01-25",
+        "exit_date": "2025-03-21",
+        "entry_price": 18.868828014900252,
+        "exit_price": 116.5291793058522,
+        "return_pct": 517.5750778682807
+      },
+      {
+        "entry_date": "2025-06-30",
+        "exit_date": "2026-09-23 (forced close, end of window)",
+        "entry_price": 158.17051357757427,
+        "exit_price": 224.95481268310547,
+        "return_pct": 42.222976707208474
+      }
+    ]
+  },
+  "GOOGL": {
+    "ticker": "GOOGL",
+    "strategy": "SMA_50_200_CROSSOVER",
+    "start_date": "2022-07-08",
+    "end_date": "2026-09-23",
+    "n_bars": 1057,
+    "n_trades": 2,
+    "win_rate": 1.0,
+    "total_return_pct": 136.55596428162636,
+    "buy_hold_return_pct": 186.73296747730865,
+    "max_drawdown_pct": -32.88507561662737,
+    "sharpe_ratio": 0.9310578446705281,
+    "exposure_pct": 73.69914853358563,
+    "trades": [
+      {
+        "entry_date": "2023-05-04",
+        "exit_date": "2025-04-09",
+        "entry_price": 104.60013627678492,
+        "exit_price": 143.5989217851809,
+        "return_pct": 37.28368518105975
+      },
+      {
+        "entry_date": "2025-07-24",
+        "exit_date": "2026-09-23 (forced close, end of window)",
+        "entry_price": 196.53966556409512,
+        "exit_price": 338.661,
+        "return_pct": 72.31178196421453
+      }
+    ]
+  },
+  "AMZN": {
+    "ticker": "AMZN",
+    "strategy": "SMA_50_200_CROSSOVER",
+    "start_date": "2022-07-08",
+    "end_date": "2026-09-23",
+    "n_bars": 1057,
+    "n_trades": 3,
+    "win_rate": 0.3333333333333333,
+    "total_return_pct": 28.58373931265945,
+    "buy_hold_return_pct": 115.8170276542108,
+    "max_drawdown_pct": -40.79693054520242,
+    "sharpe_ratio": 0.3547210194482829,
+    "exposure_pct": 70.29328287606434,
+    "trades": [
+      {
+        "entry_date": "2023-05-30",
+        "exit_date": "2025-04-23",
+        "entry_price": 122.4923727493286,
+        "exit_price": 183.26654695129395,
+        "return_pct": 49.614659948121925
+      },
+      {
+        "entry_date": "2025-07-09",
+        "exit_date": "2026-03-12",
+        "entry_price": 221.29107733154294,
+        "exit_price": 210.17960939025878,
+        "return_pct": -5.021200165534341
+      },
+      {
+        "entry_date": "2026-05-07",
+        "exit_date": "2026-09-23 (forced close, end of window)",
+        "entry_price": 275.2950090026855,
+        "exit_price": 249.10564073181152,
+        "return_pct": -9.513201262075372
+      }
+    ]
+  }
+}

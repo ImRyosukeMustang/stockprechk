@@ -1,0 +1,3994 @@
+"""
+backtester.py — walk-forward backtest of the predictor + decision_engine
+strategy, with realistic execution mechanics and transaction costs.
+ 
+This is the module most responsible for the project's "no look-ahead bias"
+and "walk-forward validation, not random train/test split" hard rules, so
+its design choices are documented in detail below rather than left implicit.
+ 
+WALK-FORWARD DESIGN
+--------------------
+History is split into successive folds. For each fold:
+  1. Train a fresh model on all data strictly BEFORE the fold's test window
+     (an "expanding window" — each fold's training set is a superset of the
+     previous fold's).
+  2. Generate predictions/signals for the test window using ONLY that
+     model and that window's own technical-indicator values (both computed
+     trailing-only, never touching future bars — see technical.py).
+  3. Simulate trading through the test window with realistic execution
+     (next-bar entry, stop-loss/take-profit, transaction costs — see below).
+  4. Advance to the next fold and repeat.
+ 
+This means a "prediction" for any historical date was generated using only
+a model trained on data that came before it — exactly reproducing what a
+live system would have known at that point in time.
+ 
+THE EMBARGO (why this is subtler than it looks)
+-------------------------------------------------
+The model's training LABEL for date `d` is "did price close higher
+`horizon_days` days after `d`?" — which necessarily looks at date
+`d + horizon_days`. If a fold's training set were allowed to include the
+last `horizon_days` dates immediately before the test window starts, those
+training rows' labels would depend on price action that falls INSIDE the
+test window. The model would then be trained on information from the
+future it's about to be "tested" on — a leakage bug that's easy to miss
+because it only affects a few rows at each fold boundary, but it does mean
+the walk-forward result would be silently optimistic.
+ 
+The fix (standard in time-series ML, sometimes called a "purge" or
+"embargo"): each fold's training set stops `horizon_days` bars before the
+test window begins, not immediately before it. `_fold_boundaries()` below
+enforces this — it is the single most important function in this file for
+the "no look-ahead bias" hard rule, and any change to the fold logic should
+preserve this property.
+ 
+EXECUTION MECHANICS
+--------------------
+  - A BUY/SELL decision made using date `d`'s close and indicators is
+    executed at date `d+1`'s OPEN (not `d`'s own close) — a signal can't be
+    acted on before the bar that produced it has finished.
+  - While in a position, `config.STOP_LOSS_PCT` / `config.TAKE_PROFIT_PCT`
+    are checked against each day's own high/low. This is a standard
+    daily-bar backtesting simplification: it assumes the stop/target price
+    was reachable intraday, without modeling intraday path. It is optimistic
+    on days where price gaps past both levels, and that's a known
+    approximation, not a bug to "fix" without also modeling intraday data.
+  - `config.TRANSACTION_COST_PCT` is deducted from BOTH the entry and exit
+    price of every trade (round-trip cost, per the "include transaction
+    costs" hard rule).
+  - Long-only, one position at a time, sized as 100% of capital per trade
+    (this backtester reports RETURNS, not portfolio-level position sizing —
+    config.MAX_POSITION_PCT belongs to a portfolio-level allocator, which
+    is out of scope here and noted as a limitation below).
+ 
+OUT-OF-SAMPLE PREDICTION PERSISTENCE
+--------------------------------------
+Each fold's out-of-sample predictions (the same `probs` used to drive
+trading decisions in `_simulate_trades`) are also persisted to the
+`predictions` table, tagged with `model_name = f"{ticker}_h5_wf"` and the
+originating `fold_id`. This is purely additive — it does not change any
+trading/strategy logic — and exists so that downstream diagnostics (e.g.
+conditional-edge-by-regime analysis) can query a full history of strictly
+out-of-sample probabilities rather than only the 5 live-pipeline rows.
+Because these are walk-forward OOS predictions (a different model per
+fold), they carry the "_wf" suffix to distinguish them from the live
+pipeline's `{ticker}_h5` model_name.
+ 
+KNOWN LIMITATIONS (read before trusting a backtest result)
+-------------------------------------------------------------
+  - Sentiment is excluded from the backtested strategy. sentiment.py only
+    ever has data for recent dates (see its module docstring), so a
+    historical backtest cannot fairly evaluate a sentiment-driven strategy
+    — there's no historical sentiment archive to test against. The
+    backtested decision logic therefore only combines the {prediction,
+    technical} components via decision_engine.combine_components(), not
+    {prediction, sentiment, technical} as the live pipeline does. A live
+    signal and a backtested signal for the "same" setup are NOT directly
+    comparable for this reason.
+  - Position sizing is all-or-nothing per trade; config.MAX_POSITION_PCT
+    (portfolio-level risk limits) is not modeled here.
+  - Stop-loss/take-profit intraday-fill assumption, noted above.
+  - This backtests one ticker at a time. It does not model portfolio-level
+    effects (correlation across positions, capital shared across tickers).
+"""
+ 
+from __future__ import annotations
+ 
+import json
+import sqlite3
+from datetime import datetime, timezone
+from pathlib import Path
+ 
+import config
+import database
+import decision_engine
+import predictor
+ 
+log = config.get_logger(__name__)
+ 
+REPORTS_DIR = Path(__file__).resolve().parent / "backtests"
+ 
+# fold_size is the TEST WINDOW size (trading days) per fold, not the fold
+# count — a bigger test window means fewer total folds for the same amount
+# of history. Raised from 20 -> 60 to cut total fold count roughly 60 -> 20,
+# trimming backtest runtime without touching model strength (n_estimators
+# stays at 200 in predictor._get_model_backend / config).
+DEFAULT_FOLD_SIZE = 60
+ 
+ 
+def _fold_boundaries(n_rows: int, horizon_days: int, min_train_rows: int, fold_size: int) -> list[tuple[int, int, int]]:
+    """
+    Compute (train_end, test_start, test_end) index triples, expanding-window,
+    with an embargo of `horizon_days` bars between training data and the test
+    window to prevent label leakage across the fold boundary (see module
+    docstring). All indices are positions into the full chronological feature
+    DataFrame. `train_end` is exclusive (train on rows [0, train_end)).
+    """
+    folds = []
+    test_start = min_train_rows + horizon_days
+    while test_start < n_rows:
+        train_end = test_start - horizon_days  # the embargo
+        test_end = min(test_start + fold_size, n_rows)
+        folds.append((train_end, test_start, test_end))
+        test_start += fold_size
+    return folds
+ 
+ 
+def _prepare_dataset(conn: sqlite3.Connection, ticker: str, horizon_days: int):
+    """Build the full feature+label DataFrame for `ticker`, same construction
+    as predictor.train_model, but keeping the full frame (not dropping the
+    unlabeled tail) since the backtester needs OHLC data through the very
+    last row for trade execution even where the forward-label is unknown."""
+    df = predictor.build_feature_frame(conn, ticker)
+    if df is None or df.empty:
+        return None
+    df["future_close"] = df["close"].shift(-horizon_days)
+    df["label"] = (df["future_close"] > df["close"]).astype("Int64")  # nullable int; NA for the unlabeled tail
+    return df.reset_index(drop=True)
+ 
+ 
+def _technical_component_from_row(row) -> tuple[float, str] | None:
+    """Same RSI/MACD scoring as decision_engine._technical_component, but
+    operating on an in-memory DataFrame row instead of a DB lookup, since the
+    backtester is iterating an already-built feature frame."""
+    sub_scores, descs = [], []
+ 
+    if row["rsi_14"] is not None and not _is_nan(row["rsi_14"]):
+        rsi = row["rsi_14"]
+        rsi_score = max(-1.0, min(1.0, (50 - rsi) / 30))
+        sub_scores.append(rsi_score)
+        state = "oversold" if rsi < 30 else "overbought" if rsi > 70 else "neutral"
+        descs.append(f"RSI {rsi:.1f} ({state})")
+ 
+    if row["macd"] is not None and row["macd_signal"] is not None and not _is_nan(row["macd"]) and not _is_nan(row["macd_signal"]):
+        macd_score = 1.0 if row["macd"] > row["macd_signal"] else -1.0 if row["macd"] < row["macd_signal"] else 0.0
+        sub_scores.append(macd_score)
+        state = "bullish crossover" if macd_score > 0 else "bearish crossover" if macd_score < 0 else "flat"
+        descs.append(f"MACD {state}")
+ 
+    if not sub_scores:
+        return None
+    return sum(sub_scores) / len(sub_scores), "; ".join(descs)
+ 
+ 
+def _is_nan(x) -> bool:
+    try:
+        return x != x  # NaN != NaN
+    except Exception:
+        return False
+ 
+ 
+def run_walkforward_backtest(
+    conn: sqlite3.Connection,
+    ticker: str,
+    horizon_days: int = predictor.DEFAULT_HORIZON_DAYS,
+    min_train_rows: int = predictor.MIN_TRAINING_ROWS,
+    fold_size: int = DEFAULT_FOLD_SIZE,
+) -> dict | None:
+    """
+    Run a full walk-forward backtest for `ticker`. Returns a metrics dict
+    (also saved as JSON under backtests/), or None if there wasn't enough
+    data or a required dependency is missing.
+    """
+    backend_name, factory = predictor._get_model_backend()
+    if factory is None:
+        log.warning("No ML backend (xgboost or scikit-learn) available — cannot backtest %s.", ticker)
+        return None
+ 
+    df = _prepare_dataset(conn, ticker, horizon_days)
+    if df is None:
+        return None
+ 
+    folds = _fold_boundaries(len(df), horizon_days, min_train_rows, fold_size)
+    if not folds:
+        log.warning(
+            "Not enough history for %s to run even one walk-forward fold "
+            "(have %d rows, need >= %d + horizon %d).",
+            ticker, len(df), min_train_rows, horizon_days,
+        )
+        return None
+ 
+    wf_model_name = f"{ticker}_h5_wf"
+ 
+    # Collect an out-of-sample (signal, row) for every date covered by a fold.
+    oos_predictions: dict[int, float] = {}  # row index -> probability_up
+    n_predictions_saved = 0
+    for fold_id, (train_end, test_start, test_end) in enumerate(folds):
+        train_slice = df.iloc[:train_end]
+        train_slice = train_slice[train_slice["label"].notna()]
+        if train_slice["label"].nunique() < 2:
+            log.warning("%s: fold train slice [0:%d) has a single class — skipping fold.", ticker, train_end)
+            continue
+ 
+        X_train = train_slice[predictor.FEATURE_COLUMNS]
+        y_train = train_slice["label"].astype(int)
+ 
+        model = factory()
+        model.fit(X_train, y_train)
+ 
+        test_slice = df.iloc[test_start:test_end]
+        X_test = test_slice[predictor.FEATURE_COLUMNS]
+        probs = model.predict_proba(X_test)[:, 1]
+        for idx, prob in zip(test_slice.index, probs):
+            oos_predictions[idx] = float(prob)
+ 
+        # Persist this fold's out-of-sample predictions to the `predictions`
+        # table. Purely additive — does not affect trade simulation below,
+        # which continues to read from the in-memory `oos_predictions` dict.
+        for idx, prob in zip(test_slice.index, probs):
+            pred_date = df.iloc[idx]["date"]
+            date_str = pred_date.strftime("%Y-%m-%d") if hasattr(pred_date, "strftime") else str(pred_date)
+            try:
+                database.insert_prediction(
+                    conn,
+                    ticker,
+                    date_str,
+                    wf_model_name,
+                    float(prob),
+                    fold_id=fold_id,
+                )
+                n_predictions_saved += 1
+            except Exception as exc:  # noqa: BLE001
+                log.warning(
+                    "%s: failed to save walk-forward prediction for date %s (fold %d): %s",
+                    ticker, date_str, fold_id, exc,
+                )
+ 
+    if not oos_predictions:
+        log.warning("%s: no out-of-sample predictions were produced — cannot backtest.", ticker)
+        return None
+ 
+    log.info(
+        "%s: saved %d walk-forward out-of-sample predictions to predictions table (model_name=%s).",
+        ticker, n_predictions_saved, wf_model_name,
+    )
+ 
+    trades, equity_curve = _simulate_trades(df, oos_predictions)
+    metrics = _compute_metrics(df, oos_predictions, trades, equity_curve)
+    metrics.update(
+        {
+            "ticker": ticker,
+            "horizon_days": horizon_days,
+            "backend": backend_name,
+            "n_folds": len(folds),
+            "n_oos_days": len(oos_predictions),
+            "run_at": datetime.now(timezone.utc).isoformat(),
+        }
+    )
+ 
+    REPORTS_DIR.mkdir(parents=True, exist_ok=True)
+    report_path = REPORTS_DIR / f"{ticker.upper()}_h{horizon_days}_backtest.json"
+    with open(report_path, "w") as f:
+        json.dump({**metrics, "trades": trades}, f, indent=2, default=str)
+    log.info("Backtest report for %s written to %s", ticker, report_path)
+ 
+    # Also persist a queryable summary row to SQLite (backtest_results), so
+    # dashboard.py (Phase 4) can list/compare backtest runs without needing
+    # to read JSON files off disk. The JSON report remains the source of
+    # truth for the full trade log / equity curve.
+    oos_dates = [df.iloc[idx]["date"].strftime("%Y-%m-%d") for idx in sorted(oos_predictions.keys())]
+    database.insert_backtest_result(
+        conn,
+        {
+            "ticker": ticker,
+            "model_name": backend_name,
+            "start_date": oos_dates[0] if oos_dates else "",
+            "end_date": oos_dates[-1] if oos_dates else "",
+            "train_window_days": min_train_rows,
+            "test_window_days": fold_size,
+            "transaction_cost_pct": config.TRANSACTION_COST_PCT,
+            "num_trades": metrics["n_trades"],
+            "win_rate": metrics["win_rate"],
+            "strategy_return_pct": metrics["total_return_pct"],
+            "benchmark_return_pct": metrics["buy_hold_return_pct"],
+            "max_drawdown_pct": metrics["max_drawdown_pct"],
+            "sharpe_ratio": metrics["sharpe_ratio"],
+            "detail_json": json.dumps({"report_path": str(report_path)}),
+        },
+    )
+ 
+    log.info(
+        "%s backtest: %d trades, win_rate=%.1f%%, strategy_return=%.1f%%, buy_hold_return=%.1f%%, max_drawdown=%.1f%%",
+        ticker, metrics["n_trades"], metrics["win_rate"] * 100,
+        metrics["total_return_pct"], metrics["buy_hold_return_pct"], metrics["max_drawdown_pct"] * 100,
+    )
+    return metrics
+ 
+ 
+def _simulate_trades(df, oos_predictions: dict[int, float]) -> tuple[list[dict], list[dict]]:
+    """
+    Walk chronologically through the out-of-sample rows, generating a signal
+    each day from {prediction, technical} components and simulating
+    execution. Returns (trades, equity_curve). Long-only, one position at a
+    time, all-or-nothing sizing (see module docstring limitations).
+    """
+    oos_indices = sorted(oos_predictions.keys())
+    trades: list[dict] = []
+    equity_curve: list[dict] = []
+ 
+    capital = 1.0  # normalized starting capital; results reported as % return
+    position: dict | None = None
+ 
+    for i, idx in enumerate(oos_indices):
+        row = df.iloc[idx]
+        prob_up = oos_predictions[idx]
+        pred_score = (prob_up - 0.5) * 2
+        pred_component = (pred_score, f"model P(up)={prob_up:.0%}")
+        tech_component = _technical_component_from_row(row)
+ 
+        components = {"prediction": pred_component}
+        if tech_component is not None:
+            components["technical"] = tech_component
+        decision = decision_engine.combine_components(components)
+ 
+        # Mark-to-market today's equity before acting on today's decision.
+        if position is not None:
+            unrealized = (row["close"] - position["entry_price"]) / position["entry_price"]
+            equity_curve.append({"date": row["date"].strftime("%Y-%m-%d"), "equity": capital * (1 + unrealized)})
+        else:
+            equity_curve.append({"date": row["date"].strftime("%Y-%m-%d"), "equity": capital})
+ 
+        has_next_bar = idx + 1 < len(df)
+ 
+        # Manage an open position: stop-loss / take-profit against today's range first.
+        if position is not None:
+            stop_price = position["entry_price"] * (1 - config.STOP_LOSS_PCT)
+            target_price = position["entry_price"] * (1 + config.TAKE_PROFIT_PCT)
+            exit_price = None
+            exit_reason = None
+            if row["low"] <= stop_price:
+                exit_price, exit_reason = stop_price, "stop_loss"
+            elif row["high"] >= target_price:
+                exit_price, exit_reason = target_price, "take_profit"
+            elif decision["signal"] == "SELL" and has_next_bar:
+                exit_price, exit_reason = df.iloc[idx + 1]["open"], "sell_signal"
+ 
+            if exit_price is not None:
+                exit_price *= (1 - config.TRANSACTION_COST_PCT)
+                trade_return = (exit_price - position["entry_price"]) / position["entry_price"]
+                capital *= (1 + trade_return)
+                trades.append(
+                    {
+                        "entry_date": position["entry_date"],
+                        "exit_date": row["date"].strftime("%Y-%m-%d"),
+                        "entry_price": position["entry_price"],
+                        "exit_price": exit_price,
+                        "return_pct": trade_return * 100,
+                        "exit_reason": exit_reason,
+                    }
+                )
+                position = None
+ 
+        # Consider a new entry only if flat and there's a next bar to enter on.
+        if position is None and decision["signal"] == "BUY" and has_next_bar:
+            entry_price = df.iloc[idx + 1]["open"] * (1 + config.TRANSACTION_COST_PCT)
+            position = {"entry_price": entry_price, "entry_date": df.iloc[idx + 1]["date"].strftime("%Y-%m-%d")}
+ 
+    # Force-close any position still open at the end of the OOS window, at
+    # the last known close, so metrics reflect a fully realized backtest.
+    if position is not None:
+        last_row = df.iloc[oos_indices[-1]]
+        exit_price = last_row["close"] * (1 - config.TRANSACTION_COST_PCT)
+        trade_return = (exit_price - position["entry_price"]) / position["entry_price"]
+        capital *= (1 + trade_return)
+        trades.append(
+            {
+                "entry_date": position["entry_date"],
+                "exit_date": last_row["date"].strftime("%Y-%m-%d"),
+                "entry_price": position["entry_price"],
+                "exit_price": exit_price,
+                "return_pct": trade_return * 100,
+                "exit_reason": "end_of_backtest",
+            }
+        )
+ 
+    return trades, equity_curve
+ 
+ 
+def _compute_metrics(df, oos_predictions: dict[int, float], trades: list[dict], equity_curve: list[dict]) -> dict:
+    n_trades = len(trades)
+    wins = [t for t in trades if t["return_pct"] > 0]
+    win_rate = len(wins) / n_trades if n_trades else 0.0
+    avg_trade_return_pct = sum(t["return_pct"] for t in trades) / n_trades if n_trades else 0.0
+ 
+    total_return_pct = 0.0
+    if equity_curve:
+        total_return_pct = (equity_curve[-1]["equity"] - 1.0) * 100
+ 
+    # Buy-and-hold benchmark over the same OOS window, for comparison.
+    oos_indices = sorted(oos_predictions.keys())
+    buy_hold_return_pct = 0.0
+    if oos_indices:
+        start_price = df.iloc[oos_indices[0]]["close"]
+        end_price = df.iloc[oos_indices[-1]]["close"]
+        buy_hold_return_pct = (end_price - start_price) / start_price * 100
+ 
+    # Max drawdown from the equity curve.
+    peak = -float("inf")
+    max_drawdown = 0.0
+    for point in equity_curve:
+        peak = max(peak, point["equity"])
+        drawdown = (point["equity"] - peak) / peak if peak > 0 else 0.0
+        max_drawdown = min(max_drawdown, drawdown)
+ 
+    # Rough annualized Sharpe-like ratio from daily equity returns (0% risk-free rate assumed).
+    sharpe_ratio = None
+    if len(equity_curve) > 2:
+        daily_returns = []
+        for prev, curr in zip(equity_curve, equity_curve[1:]):
+            if prev["equity"] > 0:
+                daily_returns.append((curr["equity"] - prev["equity"]) / prev["equity"])
+        if daily_returns:
+            mean_r = sum(daily_returns) / len(daily_returns)
+            variance = sum((r - mean_r) ** 2 for r in daily_returns) / len(daily_returns)
+            std_r = variance ** 0.5
+            if std_r > 0:
+                sharpe_ratio = (mean_r / std_r) * (252 ** 0.5)
+ 
+    return {
+        "n_trades": n_trades,
+        "win_rate": win_rate,
+        "avg_trade_return_pct": avg_trade_return_pct,
+        "total_return_pct": total_return_pct,
+        "buy_hold_return_pct": buy_hold_return_pct,
+        "max_drawdown_pct": max_drawdown,
+        "sharpe_ratio": sharpe_ratio,
+    }
+ 
+ 
+def backtest_watchlist(conn: sqlite3.Connection, tickers: list[str] | None = None, horizon_days: int = predictor.DEFAULT_HORIZON_DAYS) -> dict[str, dict | None]:
+    tickers = tickers or config.WATCHLIST
+    results: dict[str, dict | None] = {}
+    for ticker in tickers:
+        try:
+            results[ticker] = run_walkforward_backtest(conn, ticker, horizon_days)
+        except Exception as exc:
+            log.error("Unexpected error backtesting %s: %s", ticker, exc)
+            results[ticker] = None
+    return results
+ 
+ 
+if __name__ == "__main__":
+    database.init_db()
+    with database.get_connection() as conn:
+        summary = backtest_watchlist(conn)
+        log.info("=== Backtest summary ===")
+        for ticker, metrics in summary.items():
+            log.info("%s: %s", ticker, metrics)
+"""
+compare_strategies.py
+
+Compares three things, per ticker, over the same backtest window:
+    1. SMA 50/200 crossover baseline (from backtests/sma_baseline_results.json)
+    2. ML (XGBoost) strategy (from the backtest_results table in stockoracle.db)
+    3. Buy-and-hold (embedded in both of the above as a benchmark column)
+
+Prints a side-by-side table and a verdict on whether the ML model's added
+complexity is actually earning its keep versus a 70-year-old technical rule.
+"""
+
+from __future__ import annotations
+
+import json
+import sqlite3
+from pathlib import Path
+
+import config
+
+logger = config.get_logger(__name__)
+
+SMA_RESULTS_PATH = Path("backtests") / "sma_baseline_results.json"
+DB_PATH = Path("stockoracle.db")
+
+
+def load_sma_results() -> dict:
+    """Load the SMA baseline results produced by sma_baseline.py."""
+    if not SMA_RESULTS_PATH.exists():
+        logger.error(
+            "%s not found. Run sma_baseline.py first.", SMA_RESULTS_PATH
+        )
+        return {}
+
+    with open(SMA_RESULTS_PATH, "r") as f:
+        return json.load(f)
+
+
+def load_ml_results() -> dict:
+    """Load the most recent ML backtest row per ticker from stockoracle.db."""
+    if not DB_PATH.exists():
+        logger.error("%s not found.", DB_PATH)
+        return {}
+
+    query = """
+        SELECT
+            ticker,
+            strategy,
+            start_date,
+            end_date,
+            num_trades,
+            win_rate,
+            strategy_return_pct,
+            benchmark_return_pct,
+            max_drawdown_pct,
+            sharpe_ratio
+        FROM backtest_results
+        WHERE rowid IN (
+            SELECT MAX(rowid)
+            FROM backtest_results
+            GROUP BY ticker
+        )
+    """
+
+    results: dict[str, dict] = {}
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            conn.row_factory = sqlite3.Row
+            cursor = conn.execute(query)
+            for row in cursor.fetchall():
+                ticker = row["ticker"]
+                results[ticker] = {
+                    "ticker": ticker,
+                    "strategy": row["strategy"],
+                    "start_date": row["start_date"],
+                    "end_date": row["end_date"],
+                    "n_trades": row["num_trades"],
+                    "win_rate": row["win_rate"],
+                    "total_return_pct": row["strategy_return_pct"],
+                    "buy_hold_return_pct": row["benchmark_return_pct"],
+                    "max_drawdown_pct": row["max_drawdown_pct"],
+                    "sharpe_ratio": row["sharpe_ratio"],
+                }
+    except sqlite3.Error:
+        logger.exception("Failed to read backtest_results from %s", DB_PATH)
+        return {}
+
+    return results
+
+
+def _fmt_pct(value) -> str:
+    try:
+        return f"{float(value):.1f}%"
+    except (TypeError, ValueError):
+        return "n/a"
+
+
+def _fmt_num(value, decimals: int = 2) -> str:
+    try:
+        return f"{float(value):.{decimals}f}"
+    except (TypeError, ValueError):
+        return "n/a"
+
+
+def print_comparison(sma_results: dict, ml_results: dict) -> None:
+    """Print a side-by-side comparison table for each ticker in the watchlist."""
+    header = (
+        f"{'Ticker':<10}{'Strategy':<16}{'Return':>9}{'B&H':>9}"
+        f"{'Trades':>8}{'Win%':>8}{'Sharpe':>8}{'MaxDD':>8}"
+    )
+    sep = "-" * len(header)
+
+    print("\n" + "=" * len(header))
+    print("STRATEGY COMPARISON: SMA 50/200 vs. ML (XGBoost)")
+    print("=" * len(header))
+    print(header)
+    print(sep)
+
+    for ticker in config.WATCHLIST:
+        sma = sma_results.get(ticker)
+        ml = ml_results.get(ticker)
+
+        if sma is not None:
+            print(
+                f"{ticker:<10}{'SMA 50/200':<16}"
+                f"{_fmt_pct(sma.get('total_return_pct')):>9}"
+                f"{_fmt_pct(sma.get('buy_hold_return_pct')):>9}"
+                f"{sma.get('n_trades', 'n/a'):>8}"
+                f"{_fmt_pct((sma.get('win_rate') or 0) * 100):>8}"
+                f"{_fmt_num(sma.get('sharpe_ratio')):>8}"
+                f"{_fmt_pct(sma.get('max_drawdown_pct')):>8}"
+            )
+        else:
+            print(f"{ticker:<10}{'SMA 50/200':<16}{'no data':>9}")
+
+        if ml is not None:
+            ml_win_rate = ml.get("win_rate")
+            # win_rate may already be stored as a 0-100 percentage or a 0-1
+            # fraction depending on how the ML backtester wrote it; normalize.
+            if ml_win_rate is not None and ml_win_rate <= 1.0:
+                ml_win_rate = ml_win_rate * 100
+            print(
+                f"{ticker:<10}{'ML (XGBoost)':<16}"
+                f"{_fmt_pct(ml.get('total_return_pct')):>9}"
+                f"{_fmt_pct(ml.get('buy_hold_return_pct')):>9}"
+                f"{ml.get('n_trades', 'n/a'):>8}"
+                f"{_fmt_pct(ml_win_rate):>8}"
+                f"{_fmt_num(ml.get('sharpe_ratio')):>8}"
+                f"{_fmt_pct(ml.get('max_drawdown_pct')):>8}"
+            )
+        else:
+            print(f"{ticker:<10}{'ML (XGBoost)':<16}{'no data':>9}")
+
+        print(sep)
+
+    print()
+
+
+def print_verdict(sma_results: dict, ml_results: dict) -> None:
+    """Print the head-to-head summary and final verdict."""
+    sma_beats_ml = 0
+    ml_beats_sma = 0
+    sma_beats_bh = 0
+    ml_beats_bh = 0
+    n_compared = 0
+
+    for ticker in config.WATCHLIST:
+        sma = sma_results.get(ticker)
+        ml = ml_results.get(ticker)
+
+        if sma is not None and sma.get("total_return_pct") is not None:
+            if sma["total_return_pct"] > sma.get("buy_hold_return_pct", float("inf")):
+                sma_beats_bh += 1
+
+        if ml is not None and ml.get("total_return_pct") is not None:
+            if ml["total_return_pct"] > ml.get("buy_hold_return_pct", float("inf")):
+                ml_beats_bh += 1
+
+        if sma is not None and ml is not None:
+            n_compared += 1
+            if sma.get("total_return_pct", float("-inf")) > ml.get("total_return_pct", float("-inf")):
+                sma_beats_ml += 1
+            elif ml.get("total_return_pct", float("-inf")) > sma.get("total_return_pct", float("-inf")):
+                ml_beats_sma += 1
+
+    print("=" * 60)
+    print("SUMMARY")
+    print("=" * 60)
+    print(f"Tickers compared head-to-head: {n_compared}")
+    print(f"  SMA 50/200 beat ML:        {sma_beats_ml}")
+    print(f"  ML beat SMA 50/200:        {ml_beats_sma}")
+    print(f"  SMA 50/200 beat buy&hold:  {sma_beats_bh}")
+    print(f"  ML beat buy&hold:          {ml_beats_bh}")
+    print("=" * 60)
+
+    if ml_beats_sma > sma_beats_ml:
+        print("✅ ML BEATS SMA. The complexity is paying off.")
+    elif sma_beats_ml > ml_beats_sma:
+        print("🚨 SMA BEATS ML. The ML isn't adding value yet.")
+    else:
+        print("🤷 TIE. ML complexity isn't justified.")
+    print("=" * 60 + "\n")
+
+
+if __name__ == "__main__":
+    sma_results = load_sma_results()
+    ml_results = load_ml_results()
+
+    if not sma_results:
+        logger.warning("No SMA results loaded — run sma_baseline.py first.")
+    if not ml_results:
+        logger.warning("No ML results loaded — check backtest_results table in stockoracle.db.")
+
+    print_comparison(sma_results, ml_results)
+    print_verdict(sma_results, ml_results)
+from __future__ import annotations
+
+import json
+import sqlite3
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+
+import config
+import database
+
+logger = config.get_logger(__name__)
+
+DB_PATH = "stockoracle.db"
+OUTPUT_PATH = Path("backtests/conditional_edge_results.json")
+
+FORWARD_DAYS = 5
+SMA_SHORT = 50
+SMA_LONG = 200
+
+BUCKET_EDGES = [0.50, 0.55, 0.60, 0.65, 0.70, 1.01]
+BUCKET_LABELS = ["0.50-0.55", "0.55-0.60", "0.60-0.65", "0.65-0.70", "0.70+"]
+
+MIN_ROWS_REQUIRED = SMA_LONG + FORWARD_DAYS + 1
+
+
+def load_price_df(conn: sqlite3.Connection, ticker: str) -> pd.DataFrame | None:
+    """Load price history for a ticker and return a sorted DataFrame, or None if unusable."""
+    try:
+        rows = database.get_price_history(conn, ticker)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Failed to load price history for %s: %s", ticker, exc)
+        return None
+
+    if not rows:
+        logger.warning("No price history rows found for %s", ticker)
+        return None
+
+    df = pd.DataFrame([dict(r) for r in rows])
+
+    if "close" not in df.columns or "date" not in df.columns:
+        logger.warning("Price history for %s missing required columns (date/close)", ticker)
+        return None
+
+    if len(df) < MIN_ROWS_REQUIRED:
+        logger.warning(
+            "Insufficient price history for %s: %d rows (need at least %d)",
+            ticker,
+            len(df),
+            MIN_ROWS_REQUIRED,
+        )
+        return None
+
+    df["date"] = pd.to_datetime(df["date"])
+    df = df.sort_values("date").reset_index(drop=True)
+    df["ticker"] = ticker
+    return df
+
+
+def compute_smas(df: pd.DataFrame) -> pd.DataFrame:
+    """Add SMA(50) and SMA(200) columns computed from close price."""
+    df = df.copy()
+    df["sma50"] = df["close"].rolling(window=SMA_SHORT, min_periods=SMA_SHORT).mean()
+    df["sma200"] = df["close"].rolling(window=SMA_LONG, min_periods=SMA_LONG).mean()
+    return df
+
+
+def compute_forward_returns(df: pd.DataFrame) -> pd.DataFrame:
+    """Add forward N-day return column; rows without a future close get NaN."""
+    df = df.copy()
+    future_close = df["close"].shift(-FORWARD_DAYS)
+    df["forward_return"] = (future_close - df["close"]) / df["close"] * 100.0
+    return df
+
+
+def load_predictions(conn: sqlite3.Connection, ticker: str) -> pd.DataFrame | None:
+    """Load predictions for a ticker, keeping only the most recent matching model."""
+    model_pattern = f"{ticker}_h5"
+    try:
+        query = (
+            "SELECT ticker, date, model_name, probability_up "
+            "FROM predictions "
+            "WHERE ticker = ? AND model_name LIKE ?"
+        )
+        pred_df = pd.read_sql_query(query, conn, params=(ticker, f"{model_pattern}%"))
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Failed to load predictions for %s: %s", ticker, exc)
+        return None
+
+    if pred_df.empty:
+        logger.warning("No predictions found for %s matching pattern '%s%%'", ticker, model_pattern)
+        return None
+
+    pred_df["date"] = pd.to_datetime(pred_df["date"])
+
+    # If multiple model versions exist under the pattern, keep only the most
+    # recent model_name (determined by that model's latest prediction date).
+    if pred_df["model_name"].nunique() > 1:
+        latest_dates = pred_df.groupby("model_name")["date"].max()
+        most_recent_model = latest_dates.idxmax()
+        pred_df = pred_df[pred_df["model_name"] == most_recent_model]
+        logger.info(
+            "Multiple model versions found for %s; using most recent: %s",
+            ticker,
+            most_recent_model,
+        )
+
+    return pred_df[["ticker", "date", "probability_up"]]
+
+
+def build_bullish_regime_df(
+    price_df: pd.DataFrame, pred_df: pd.DataFrame
+) -> pd.DataFrame | None:
+    """Merge price + predictions, restrict to bullish SMA regime with valid forward returns."""
+    merged = pd.merge(price_df, pred_df, on=["ticker", "date"], how="inner")
+
+    # Require both SMAs defined
+    merged = merged.dropna(subset=["sma50", "sma200"])
+
+    # Bullish regime filter
+    merged = merged[merged["sma50"] > merged["sma200"]]
+
+    # Drop rows without a valid forward return (near the end of the series)
+    merged = merged.dropna(subset=["forward_return"])
+
+    # Only interested in the bullish-probability buckets (>= 0.50)
+    merged = merged[merged["probability_up"] >= 0.50]
+
+    if merged.empty:
+        return None
+
+    return merged
+
+
+def compute_bucket_stats(df: pd.DataFrame) -> pd.DataFrame:
+    """Bucket probability_up into 5 bins and compute summary stats per bucket."""
+    df = df.copy()
+    df["bucket"] = pd.cut(
+        df["probability_up"],
+        bins=BUCKET_EDGES,
+        labels=BUCKET_LABELS,
+        right=False,
+        include_lowest=True,
+    )
+
+    stats_rows = []
+    for label in BUCKET_LABELS:
+        bucket_df = df[df["bucket"] == label]
+        n = len(bucket_df)
+        if n == 0:
+            stats_rows.append(
+                {
+                    "bucket": label,
+                    "avg_return": np.nan,
+                    "median_return": np.nan,
+                    "hit_rate": np.nan,
+                    "n": 0,
+                }
+            )
+            continue
+
+        avg_return = bucket_df["forward_return"].mean()
+        median_return = bucket_df["forward_return"].median()
+        hit_rate = (bucket_df["forward_return"] > 0).mean() * 100.0
+
+        stats_rows.append(
+            {
+                "bucket": label,
+                "avg_return": avg_return,
+                "median_return": median_return,
+                "hit_rate": hit_rate,
+                "n": n,
+            }
+        )
+
+    return pd.DataFrame(stats_rows)
+
+
+def format_bucket_table(stats_df: pd.DataFrame, title: str) -> str:
+    """Render the bucket stats table as a printable string."""
+    lines = [f"=== {title} ==="]
+    lines.append(f"{'Bucket':<12}{'Avg 5d':>10}{'Median 5d':>12}{'Hit%':>8}{'N':>8}")
+
+    for _, row in stats_df.iterrows():
+        if row["n"] == 0:
+            lines.append(f"{row['bucket']:<12}{'--':>10}{'--':>12}{'--':>8}{0:>8}")
+            continue
+
+        avg_str = f"{row['avg_return']:+.2f}%"
+        median_str = f"{row['median_return']:+.2f}%"
+        hit_str = f"{row['hit_rate']:.0f}%"
+        lines.append(
+            f"{row['bucket']:<12}{avg_str:>10}{median_str:>12}{hit_str:>8}{row['n']:>8}"
+        )
+
+    return "\n".join(lines)
+
+
+def is_monotonic_increasing(stats_df: pd.DataFrame) -> bool:
+    """Check whether avg_return increases monotonically across buckets with data."""
+    valid = stats_df.dropna(subset=["avg_return"])
+    if len(valid) < 2:
+        return False
+
+    avg_returns = valid["avg_return"].to_numpy()
+    diffs = np.diff(avg_returns)
+    return bool(np.all(diffs > 0))
+
+
+def stats_df_to_records(stats_df: pd.DataFrame) -> list[dict]:
+    """Convert a bucket stats DataFrame into JSON-serializable records."""
+    records = []
+    for _, row in stats_df.iterrows():
+        records.append(
+            {
+                "bucket": row["bucket"],
+                "avg_return": None if pd.isna(row["avg_return"]) else round(float(row["avg_return"]), 4),
+                "median_return": None if pd.isna(row["median_return"]) else round(float(row["median_return"]), 4),
+                "hit_rate": None if pd.isna(row["hit_rate"]) else round(float(row["hit_rate"]), 2),
+                "n": int(row["n"]),
+            }
+        )
+    return records
+
+
+def main() -> None:
+    results: dict[str, object] = {"tickers": {}, "aggregate": {}}
+    all_regime_dfs: list[pd.DataFrame] = []
+
+    with database.get_connection() as conn:
+        for ticker in config.WATCHLIST:
+            logger.info("Processing %s", ticker)
+
+            price_df = load_price_df(conn, ticker)
+            if price_df is None:
+                continue
+
+            price_df = compute_smas(price_df)
+            price_df = compute_forward_returns(price_df)
+
+            pred_df = load_predictions(conn, ticker)
+            if pred_df is None:
+                continue
+
+            regime_df = build_bullish_regime_df(price_df, pred_df)
+            if regime_df is None or regime_df.empty:
+                logger.warning("No bullish-regime rows with predictions for %s; skipping", ticker)
+                continue
+
+            stats_df = compute_bucket_stats(regime_df)
+            table = format_bucket_table(stats_df, f"{ticker} (bullish regime)")
+            print(table)
+            print()
+
+            results["tickers"][ticker] = {
+                "buckets": stats_df_to_records(stats_df),
+                "total_samples": int(len(regime_df)),
+            }
+
+            all_regime_dfs.append(regime_df)
+
+    if not all_regime_dfs:
+        logger.error("No usable data for any ticker. Cannot compute aggregate or verdict.")
+        print("No usable data across any ticker in the watchlist. Aborting.")
+        return
+
+    combined_df = pd.concat(all_regime_dfs, ignore_index=True)
+    aggregate_stats_df = compute_bucket_stats(combined_df)
+    aggregate_table = format_bucket_table(aggregate_stats_df, "AGGREGATE (all tickers, bullish regime)")
+    print(aggregate_table)
+    print()
+
+    results["aggregate"] = {
+        "buckets": stats_df_to_records(aggregate_stats_df),
+        "total_samples": int(len(combined_df)),
+    }
+
+    OUTPUT_PATH.parent.mkdir(parents=True, exist_ok=True)
+    with open(OUTPUT_PATH, "w") as f:
+        json.dump(results, f, indent=2)
+    logger.info("Results saved to %s", OUTPUT_PATH)
+
+    if is_monotonic_increasing(aggregate_stats_df):
+        print("✅ ML HAS CONDITIONAL EDGE. Build the hybrid.")
+    else:
+        print("❌ ML HAS NO CONDITIONAL EDGE. Skip the hybrid. Use SMA alone.")
+
+
+if __name__ == "__main__":
+    main()
+"""
+config.py — StockOracle central configuration.
+
+All API keys, tunables, and safety switches live here. Every other module
+imports from this file rather than reading environment variables directly,
+so there is exactly one place to look when something needs to change.
+
+Nothing in this file talks to the network or the database. It only defines
+values and does light validation/logging on import.
+"""
+
+from __future__ import annotations
+
+import logging
+import os
+from pathlib import Path
+
+# ---------------------------------------------------------------------------
+# .env loading (optional — falls back to real environment variables if
+# python-dotenv isn't installed or there is no .env file yet)
+# ---------------------------------------------------------------------------
+try:
+    from dotenv import load_dotenv  # type: ignore
+
+    load_dotenv()
+except ImportError:
+    # python-dotenv not installed yet — that's fine, os.environ still works.
+    pass
+
+BASE_DIR = Path(__file__).resolve().parent
+
+# ---------------------------------------------------------------------------
+# SAFETY SWITCH — the whole project must respect this. No module should ever
+# place a real order, submit a real trade, or otherwise touch real money
+# while DRY_RUN is True. This starts True and should only be flipped by a
+# human, after backtesting, never automatically by code.
+# ---------------------------------------------------------------------------
+DRY_RUN: bool = True
+
+# ---------------------------------------------------------------------------
+# API keys — read from Streamlit secrets (cloud) OR environment (local).
+# All are optional at Day 0; individual modules are responsible for checking
+# whether a key they need is present and failing gracefully (skip that data
+# source, log a warning) rather than crashing the whole pipeline.
+# ---------------------------------------------------------------------------
+def _get_secret(key: str, default: str | None = None) -> str | None:
+    """Read a secret from Streamlit's secrets system if running under
+    Streamlit Cloud, otherwise from os.environ (local development)."""
+    try:
+        import streamlit as st
+        if key in st.secrets:
+            return str(st.secrets[key])
+    except Exception:
+        # Not running under Streamlit, or secrets not configured
+        pass
+    return os.environ.get(key, default)
+
+
+OPENAI_API_KEY: str | None = _get_secret("OPENAI_API_KEY")
+NEWSAPI_KEY: str | None = _get_secret("NEWSAPI_KEY")
+REDDIT_CLIENT_ID: str | None = _get_secret("REDDIT_CLIENT_ID")
+REDDIT_CLIENT_SECRET: str | None = _get_secret("REDDIT_CLIENT_SECRET")
+REDDIT_USER_AGENT: str = _get_secret("REDDIT_USER_AGENT", "StockOracle/0.1")
+
+# ---------------------------------------------------------------------------
+# LLM model selection
+# ---------------------------------------------------------------------------
+LLM_MODEL_CHEAP: str = "gpt-4o-mini"   # sentiment tagging, quick classification
+LLM_MODEL_DEEP: str = "gpt-4o"         # full thesis writing, deep reasoning
+
+# ---------------------------------------------------------------------------
+# Watchlist — the universe of tickers the pipeline operates on. Day 0: a
+# small, deliberately boring starter list. Edit freely.
+# ---------------------------------------------------------------------------
+WATCHLIST: list[str] = [
+    "AAPL",
+    "MSFT",
+    "NVDA",
+    "GOOGL",
+    "AMZN",
+]
+
+# ---------------------------------------------------------------------------
+# Risk / decision-engine settings (Phase 3 will consume these; defined now
+# so config.py is the single source of truth from day one)
+# ---------------------------------------------------------------------------
+MAX_POSITION_PCT: float = 0.05      # max % of a hypothetical portfolio per position
+MIN_CONFIDENCE_TO_ACT: float = 0.60  # signals below this confidence become HOLD
+STOP_LOSS_PCT: float = 0.08
+TAKE_PROFIT_PCT: float = 0.15
+
+# ---------------------------------------------------------------------------
+# Predictor (Phase 3 — the ML brain)
+# ---------------------------------------------------------------------------
+MODELS_DIR: Path = BASE_DIR / "models"
+MODEL_NAME: str = "xgboost_v1"          # logical name stored alongside predictions
+MIN_TRAINING_SAMPLES: int = 60          # fewer rows than this and we refuse to train
+PREDICTION_HORIZON_DAYS: int = 1        # predict direction N trading days ahead
+
+# ---------------------------------------------------------------------------
+# Backtester (Phase 3 — walk-forward validation, never a random split)
+# ---------------------------------------------------------------------------
+TRANSACTION_COST_PCT: float = 0.001     # 0.1% per trade (both entry and exit), a conservative
+                                         # round-trip-friction estimate for a liquid large-cap stock
+WALK_FORWARD_TRAIN_WINDOW: int = 120    # trading days used to train before each test block
+WALK_FORWARD_TEST_WINDOW: int = 20      # trading days evaluated before retraining and rolling forward
+WALK_FORWARD_MIN_TOTAL_BARS: int = WALK_FORWARD_TRAIN_WINDOW + WALK_FORWARD_TEST_WINDOW
+TRANSACTION_COST_PCT: float = 0.001  # 10 bps per trade side (commission + slippage estimate)
+
+# ---------------------------------------------------------------------------
+# Data-fetch settings
+# ---------------------------------------------------------------------------
+PRICE_HISTORY_PERIOD: str = "5y"     # yfinance period string
+PRICE_HISTORY_INTERVAL: str = "1d"   # yfinance interval string
+NEWS_LOOKBACK_HOURS: int = 48
+REDDIT_SUBREDDITS: list[str] = ["stocks", "wallstreetbets", "investing"]
+REDDIT_POST_LIMIT: int = 25
+
+# ---------------------------------------------------------------------------
+# Storage
+# ---------------------------------------------------------------------------
+DB_PATH: Path = BASE_DIR / "stockoracle.db"
+
+# ---------------------------------------------------------------------------
+# Scheduler (Phase 4)
+# ---------------------------------------------------------------------------
+PIPELINE_INTERVAL_MINUTES: int = 60
+
+# ---------------------------------------------------------------------------
+# LLM Analyst (Phase 4 — written thesis)
+# ---------------------------------------------------------------------------
+# Writing a full thesis costs a real gpt-4o call per ticker, so by default we
+# only bother for signals worth explaining to a human — HOLD with no
+# conviction doesn't need a paragraph justifying it. Override freely.
+THESIS_SIGNALS: list[str] = ["BUY", "SELL"]
+
+# ---------------------------------------------------------------------------
+# Logging
+# ---------------------------------------------------------------------------
+LOG_LEVEL: str = os.environ.get("STOCKORACLE_LOG_LEVEL", "INFO")
+LOG_FORMAT: str = "%(asctime)s [%(levelname)s] %(name)s: %(message)s"
+
+
+def get_logger(name: str) -> logging.Logger:
+    """Return a module-level logger configured consistently across the project."""
+    logger = logging.getLogger(name)
+    if not logger.handlers:
+        handler = logging.StreamHandler()
+        handler.setFormatter(logging.Formatter(LOG_FORMAT))
+        logger.addHandler(handler)
+        logger.setLevel(LOG_LEVEL)
+    return logger
+
+
+_log = get_logger(__name__)
+
+if DRY_RUN:
+    _log.info("StockOracle running in DRY_RUN mode — no real trades will be placed.")
+else:
+    _log.warning(
+        "DRY_RUN is False. This should only happen after backtesting has "
+        "validated the strategy. Proceeding with live-mode assumptions."
+    )
+
+# Warn (don't crash) about missing keys so Phase 1 data fetching can still
+# run partially against whatever sources are configured.
+for _key_name, _key_val in (
+    ("OPENAI_API_KEY", OPENAI_API_KEY),
+    ("NEWSAPI_KEY", NEWSAPI_KEY),
+    ("REDDIT_CLIENT_ID", REDDIT_CLIENT_ID),
+    ("REDDIT_CLIENT_SECRET", REDDIT_CLIENT_SECRET),
+):
+    if not _key_val:
+        _log.warning("%s is not set — features depending on it will be skipped.", _key_name)
+"""
+dashboard.py — Streamlit + Plotly UI for StockOracle. Read-mostly: it shows
+what's already in the database (prices, indicators, sentiment, predictions,
+signals, backtest results) and offers a button to run the pipeline, but it
+never places a trade — it can't, since nothing in this project does.
+
+Run with:
+    streamlit run dashboard.py
+
+This file is NOT meant to be run with plain `python dashboard.py` — Streamlit
+apps need the `streamlit run` launcher to work (it's what sets up the web
+server and the script-reruns-on-interaction model). If someone does run it
+directly, the import below fails fast with a clear message instead of an
+unrelated traceback.
+"""
+
+from __future__ import annotations
+
+import sys
+
+import config
+import database
+
+log = config.get_logger(__name__)
+
+try:
+    import streamlit as st
+except ImportError:
+    print(
+        "Streamlit is not installed (`pip install streamlit`), or this file was run with "
+        "`python dashboard.py` instead of `streamlit run dashboard.py`. Either way, this "
+        "dashboard can't start.",
+        file=sys.stderr,
+    )
+    sys.exit(1)
+
+try:
+    import plotly.graph_objects as go
+    from plotly.subplots import make_subplots
+except ImportError:
+    st.error("Plotly is not installed. Run `pip install plotly` and restart the dashboard.")
+    st.stop()
+
+
+st.set_page_config(page_title="StockOracle", layout="wide")
+
+database.init_db()
+
+
+def _dry_run_badge() -> None:
+    if config.DRY_RUN:
+        st.success("DRY_RUN = True — research mode. No trades are being placed by this system.")
+    else:
+        st.error(
+            "DRY_RUN = False — this instance is configured for live behavior. "
+            "This should only be true after backtesting has validated the strategy."
+        )
+
+
+def _price_chart(conn, ticker: str):
+    rows = database.get_price_and_indicators(conn, ticker)
+    if not rows:
+        st.info(f"No price history stored for {ticker} yet. Run the pipeline first.")
+        return
+
+    dates = [r["date"] for r in rows]
+    closes = [r["close"] for r in rows]
+
+    fig = make_subplots(
+        rows=3, cols=1, shared_xaxes=True, row_heights=[0.55, 0.2, 0.25],
+        vertical_spacing=0.03,
+        subplot_titles=("Price + Bollinger Bands + SMAs", "RSI(14)", "MACD"),
+    )
+
+    fig.add_trace(go.Scatter(x=dates, y=closes, name="Close", line=dict(color="#1f77b4")), row=1, col=1)
+
+    bb_upper = [r["bb_upper"] for r in rows]
+    bb_lower = [r["bb_lower"] for r in rows]
+    if any(v is not None for v in bb_upper):
+        fig.add_trace(go.Scatter(x=dates, y=bb_upper, name="BB Upper", line=dict(color="gray", dash="dot"), opacity=0.6), row=1, col=1)
+        fig.add_trace(go.Scatter(x=dates, y=bb_lower, name="BB Lower", line=dict(color="gray", dash="dot"), opacity=0.6), row=1, col=1)
+
+    sma_50 = [r["sma_50"] for r in rows]
+    sma_200 = [r["sma_200"] for r in rows]
+    if any(v is not None for v in sma_50):
+        fig.add_trace(go.Scatter(x=dates, y=sma_50, name="SMA(50)", line=dict(color="orange")), row=1, col=1)
+    if any(v is not None for v in sma_200):
+        fig.add_trace(go.Scatter(x=dates, y=sma_200, name="SMA(200)", line=dict(color="purple")), row=1, col=1)
+
+    rsi = [r["rsi_14"] for r in rows]
+    if any(v is not None for v in rsi):
+        fig.add_trace(go.Scatter(x=dates, y=rsi, name="RSI(14)", line=dict(color="green")), row=2, col=1)
+        fig.add_hline(y=70, line_dash="dash", line_color="red", opacity=0.4, row=2, col=1)
+        fig.add_hline(y=30, line_dash="dash", line_color="red", opacity=0.4, row=2, col=1)
+
+    macd = [r["macd"] for r in rows]
+    macd_signal = [r["macd_signal"] for r in rows]
+    if any(v is not None for v in macd):
+        fig.add_trace(go.Scatter(x=dates, y=macd, name="MACD", line=dict(color="#1f77b4")), row=3, col=1)
+        fig.add_trace(go.Scatter(x=dates, y=macd_signal, name="Signal", line=dict(color="orange")), row=3, col=1)
+
+    fig.update_layout(height=750, showlegend=True, margin=dict(t=40, b=20))
+    st.plotly_chart(fig, use_container_width=True)
+
+
+def _signal_panel(conn, ticker: str) -> None:
+    row = database.get_latest_signal(conn, ticker)
+    if row is None:
+        st.info("No signal generated yet for this ticker. Run the pipeline first.")
+        return
+
+    signal_color = {"BUY": "green", "SELL": "red", "HOLD": "gray"}.get(row["signal"], "gray")
+    col1, col2 = st.columns([1, 2])
+    with col1:
+        st.markdown(f"### :{signal_color}[{row['signal']}]")
+        st.metric("Confidence", f"{row['confidence']:.0%}")
+        st.caption(f"As of {row['date']}" + (" (DRY_RUN)" if row["dry_run"] else " (LIVE)"))
+    with col2:
+        st.markdown("**Reasoning**")
+        st.write(row["reasoning"] or "—")
+        if row["thesis"]:
+            st.markdown("**Analyst thesis**")
+            st.write(row["thesis"])
+
+
+def _sentiment_panel(conn, ticker: str) -> None:
+    rows = database.get_all_sentiment(conn, ticker) if hasattr(database, "get_all_sentiment") else []
+    if not rows:
+        # Fallback for a database.py without get_all_sentiment (older Phase 2
+        # copies) — same query, kept local so the dashboard degrades gracefully.
+        rows = conn.execute(
+            "SELECT * FROM sentiment_scores WHERE ticker = ? ORDER BY date ASC", (ticker,)
+        ).fetchall()
+    if not rows:
+        st.info("No sentiment data stored yet for this ticker.")
+        return
+
+    by_source: dict[str, dict[str, list]] = {}
+    for r in rows:
+        by_source.setdefault(r["source_type"], {"dates": [], "scores": []})
+        by_source[r["source_type"]]["dates"].append(r["date"])
+        by_source[r["source_type"]]["scores"].append(r["score"])
+
+    fig = go.Figure()
+    for source, series in by_source.items():
+        fig.add_trace(go.Scatter(x=series["dates"], y=series["scores"], name=source, mode="lines+markers"))
+    fig.add_hline(y=0, line_color="gray", opacity=0.4)
+    fig.update_layout(height=300, yaxis_title="Sentiment (-1 to 1)", margin=dict(t=20, b=20))
+    st.plotly_chart(fig, use_container_width=True)
+
+
+def _backtest_panel(conn, ticker: str) -> None:
+    rows = database.get_backtest_results(conn, ticker) if hasattr(database, "get_backtest_results") else []
+    if not rows:
+        st.info("No backtest results stored yet. Run `python backtester.py` first.")
+        return
+
+    st.dataframe(
+        [
+            {
+                "Run at": r["created_at"],
+                "Model": r["model_name"],
+                "Period": f"{r['start_date']} → {r['end_date']}",
+                "Trades": r["num_trades"],
+                "Win rate": f"{r['win_rate']:.0%}" if r["win_rate"] is not None else "—",
+                "Strategy return": f"{r['strategy_return_pct']:+.1f}%",
+                "Buy & hold return": f"{r['benchmark_return_pct']:+.1f}%",
+                "Max drawdown": f"{r['max_drawdown_pct']:.1%}" if r["max_drawdown_pct"] is not None else "—",
+                "Sharpe": f"{r['sharpe_ratio']:.2f}" if r["sharpe_ratio"] is not None else "—",
+            }
+            for r in rows
+        ],
+        use_container_width=True,
+    )
+    st.caption(
+        "Backtested signals use only {prediction, technical} components — sentiment is excluded "
+        "because it has no historical archive (see backtester.py's module docstring)."
+    )
+
+
+def main() -> None:
+    st.title("📈 StockOracle")
+    st.caption("Research tool — analysis and reasoning, not financial advice.")
+    _dry_run_badge()
+
+    with database.get_connection() as conn:
+        tickers_in_db = [
+            r["ticker"]
+            for r in conn.execute("SELECT DISTINCT ticker FROM prices ORDER BY ticker").fetchall()
+        ]
+        watchlist_tickers = sorted(set(config.WATCHLIST) | set(tickers_in_db))
+
+        st.sidebar.header("Watchlist")
+        ticker = st.sidebar.selectbox("Ticker", watchlist_tickers or config.WATCHLIST)
+
+        if st.sidebar.button("Run pipeline now", help="Fetch fresh data and regenerate signals for this ticker."):
+            with st.spinner(f"Running pipeline for {ticker}..."):
+                import main as pipeline_main
+                pipeline_main.run_pipeline([ticker])
+            st.sidebar.success("Pipeline run complete — refresh below to see updates.")
+
+        st.sidebar.divider()
+        st.sidebar.caption(f"Model: {config.MODEL_NAME if hasattr(config, 'MODEL_NAME') else 'predictor'}")
+        st.sidebar.caption(f"Min confidence to act: {config.MIN_CONFIDENCE_TO_ACT:.0%}")
+
+        st.header(f"{ticker}")
+        _signal_panel(conn, ticker)
+
+        st.subheader("Price & Technicals")
+        _price_chart(conn, ticker)
+
+        st.subheader("Sentiment History")
+        _sentiment_panel(conn, ticker)
+
+        st.subheader("Backtest Results")
+        _backtest_panel(conn, ticker)
+
+
+if __name__ == "__main__":
+    main()
+"""
+data_fetcher.py — pulls raw data from external sources and writes it into SQLite.
+
+Sources, each independent of the others (one failing/missing-key doesn't stop
+the rest):
+  - yfinance      -> price history + fundamentals
+  - Google News RSS (via feedparser) -> free, no API key needed
+  - NewsAPI       -> optional, requires config.NEWSAPI_KEY
+  - Reddit (praw) -> optional, requires config.REDDIT_CLIENT_ID/SECRET
+
+Every public fetch_* function:
+  - takes a ticker (and an open sqlite3 connection),
+  - is safe to call repeatedly (dedup happens at the DB layer via UNIQUE
+    constraints / INSERT OR IGNORE),
+  - never raises on a missing optional dependency or missing API key — it
+    logs a warning and returns 0 (rows written) instead.
+
+This module intentionally does not decide *when* to fetch (that's main.py's
+job) — it just knows *how*.
+"""
+
+from __future__ import annotations
+
+import json
+import sqlite3
+import urllib.parse
+from datetime import datetime, timedelta, timezone
+
+import config
+import database
+
+log = config.get_logger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Prices + fundamentals (yfinance)
+# ---------------------------------------------------------------------------
+
+def fetch_prices(conn: sqlite3.Connection, ticker: str) -> int:
+    """Fetch OHLCV history for `ticker` via yfinance and store new bars.
+    Returns the number of bars fetched (not necessarily all new, since
+    INSERT OR IGNORE silently skips duplicates)."""
+    try:
+        import yfinance as yf
+    except ImportError:
+        log.warning("yfinance not installed — skipping price fetch for %s. `pip install yfinance`.", ticker)
+        return 0
+
+    try:
+        hist = yf.Ticker(ticker).history(
+            period=config.PRICE_HISTORY_PERIOD,
+            interval=config.PRICE_HISTORY_INTERVAL,
+        )
+    except Exception as exc:  # network errors, rate limits, bad ticker, etc.
+        log.error("Failed to fetch price history for %s: %s", ticker, exc)
+        return 0
+
+    if hist.empty:
+        log.warning("yfinance returned no price data for %s", ticker)
+        return 0
+
+    rows = []
+    for idx, row in hist.iterrows():
+        rows.append(
+            {
+                "date": idx.strftime("%Y-%m-%d"),
+                "open": float(row["Open"]),
+                "high": float(row["High"]),
+                "low": float(row["Low"]),
+                "close": float(row["Close"]),
+                "volume": int(row["Volume"]),
+            }
+        )
+
+    database.insert_price_bars(conn, ticker, rows)
+    log.info("Fetched %d price bars for %s", len(rows), ticker)
+    return len(rows)
+
+
+def fetch_fundamentals(conn: sqlite3.Connection, ticker: str) -> bool:
+    """Fetch a fundamentals snapshot for `ticker` via yfinance. Returns True on success."""
+    try:
+        import yfinance as yf
+    except ImportError:
+        log.warning("yfinance not installed — skipping fundamentals fetch for %s.", ticker)
+        return False
+
+    try:
+        info = yf.Ticker(ticker).info
+    except Exception as exc:
+        log.error("Failed to fetch fundamentals for %s: %s", ticker, exc)
+        return False
+
+    if not info:
+        log.warning("yfinance returned no fundamentals info for %s", ticker)
+        return False
+
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    database.insert_fundamentals(
+        conn,
+        ticker=ticker,
+        date=today,
+        market_cap=info.get("marketCap"),
+        pe_ratio=info.get("trailingPE"),
+        eps=info.get("trailingEps"),
+        dividend_yield=info.get("dividendYield"),
+        sector=info.get("sector"),
+        industry=info.get("industry"),
+        raw_json=json.dumps(info, default=str),
+    )
+    log.info("Fetched fundamentals snapshot for %s", ticker)
+    return True
+
+
+# ---------------------------------------------------------------------------
+# News — Google News RSS (free, no key) + NewsAPI (optional, needs key)
+# ---------------------------------------------------------------------------
+
+def fetch_google_news(conn: sqlite3.Connection, ticker: str, company_name: str | None = None) -> int:
+    """Fetch recent headlines for `ticker` from Google News RSS via feedparser.
+    No API key required. `company_name`, if given, is used alongside the
+    ticker to improve search relevance (e.g. 'AAPL' + 'Apple')."""
+    try:
+        import feedparser
+    except ImportError:
+        log.warning("feedparser not installed — skipping Google News fetch for %s. `pip install feedparser`.", ticker)
+        return 0
+
+    query = f"{ticker} stock"
+    if company_name:
+        query = f"{company_name} ({ticker}) stock"
+    url = "https://news.google.com/rss/search?" + urllib.parse.urlencode(
+        {"q": query, "hl": "en-US", "gl": "US", "ceid": "US:en"}
+    )
+
+    try:
+        feed = feedparser.parse(url)
+    except Exception as exc:
+        log.error("Failed to fetch Google News for %s: %s", ticker, exc)
+        return 0
+
+    count = 0
+    for entry in feed.entries:
+        published_at = None
+        if getattr(entry, "published_parsed", None):
+            published_at = datetime(*entry.published_parsed[:6], tzinfo=timezone.utc).isoformat()
+        database.insert_news_item(
+            conn,
+            ticker=ticker,
+            source="google_news",
+            title=entry.get("title", ""),
+            url=entry.get("link", ""),
+            published_at=published_at,
+            summary=entry.get("summary"),
+        )
+        count += 1
+
+    log.info("Fetched %d Google News items for %s", count, ticker)
+    return count
+
+
+def fetch_newsapi(conn: sqlite3.Connection, ticker: str, company_name: str | None = None) -> int:
+    """Fetch recent articles for `ticker` from NewsAPI. Requires config.NEWSAPI_KEY.
+    Returns 0 (and logs a warning) if the key isn't configured or the request fails."""
+    if not config.NEWSAPI_KEY:
+        log.warning("NEWSAPI_KEY not set — skipping NewsAPI fetch for %s.", ticker)
+        return 0
+
+    try:
+        import requests
+    except ImportError:
+        log.warning("requests not installed — skipping NewsAPI fetch for %s. `pip install requests`.", ticker)
+        return 0
+
+    query = company_name or ticker
+    since = (datetime.now(timezone.utc) - timedelta(hours=config.NEWS_LOOKBACK_HOURS)).strftime("%Y-%m-%dT%H:%M:%S")
+    params = {
+        "q": query,
+        "from": since,
+        "sortBy": "publishedAt",
+        "language": "en",
+        "apiKey": config.NEWSAPI_KEY,
+    }
+
+    try:
+        resp = requests.get("https://newsapi.org/v2/everything", params=params, timeout=10)
+        resp.raise_for_status()
+        data = resp.json()
+    except Exception as exc:
+        log.error("Failed to fetch NewsAPI results for %s: %s", ticker, exc)
+        return 0
+
+    articles = data.get("articles", [])
+    count = 0
+    for article in articles:
+        database.insert_news_item(
+            conn,
+            ticker=ticker,
+            source="newsapi",
+            title=article.get("title", ""),
+            url=article.get("url", ""),
+            published_at=article.get("publishedAt"),
+            summary=article.get("description"),
+        )
+        count += 1
+
+    log.info("Fetched %d NewsAPI items for %s", count, ticker)
+    return count
+
+
+# ---------------------------------------------------------------------------
+# Reddit (praw) — optional
+# ---------------------------------------------------------------------------
+
+def fetch_reddit_posts(conn: sqlite3.Connection, ticker: str) -> int:
+    """Fetch recent posts mentioning `ticker` from the configured subreddits via praw.
+    Requires config.REDDIT_CLIENT_ID and config.REDDIT_CLIENT_SECRET."""
+    if not (config.REDDIT_CLIENT_ID and config.REDDIT_CLIENT_SECRET):
+        log.warning("Reddit credentials not set — skipping Reddit fetch for %s.", ticker)
+        return 0
+
+    try:
+        import praw
+    except ImportError:
+        log.warning("praw not installed — skipping Reddit fetch for %s. `pip install praw`.", ticker)
+        return 0
+
+    try:
+        reddit = praw.Reddit(
+            client_id=config.REDDIT_CLIENT_ID,
+            client_secret=config.REDDIT_CLIENT_SECRET,
+            user_agent=config.REDDIT_USER_AGENT,
+        )
+    except Exception as exc:
+        log.error("Failed to authenticate with Reddit: %s", exc)
+        return 0
+
+    count = 0
+    for subreddit_name in config.REDDIT_SUBREDDITS:
+        try:
+            subreddit = reddit.subreddit(subreddit_name)
+            for submission in subreddit.search(ticker, limit=config.REDDIT_POST_LIMIT, sort="new"):
+                created_utc = datetime.fromtimestamp(submission.created_utc, tz=timezone.utc).isoformat()
+                database.insert_reddit_post(
+                    conn,
+                    ticker=ticker,
+                    subreddit=subreddit_name,
+                    post_id=submission.id,
+                    title=submission.title,
+                    score=submission.score,
+                    num_comments=submission.num_comments,
+                    created_utc=created_utc,
+                    url=f"https://reddit.com{submission.permalink}",
+                )
+                count += 1
+        except Exception as exc:
+            log.error("Failed to fetch Reddit posts from r/%s for %s: %s", subreddit_name, ticker, exc)
+            continue
+
+    log.info("Fetched %d Reddit posts for %s", count, ticker)
+    return count
+
+
+# ---------------------------------------------------------------------------
+# Orchestration for a single ticker (main.py drives calling this per ticker)
+# ---------------------------------------------------------------------------
+
+def fetch_all_for_ticker(conn: sqlite3.Connection, ticker: str, company_name: str | None = None) -> dict[str, int]:
+    """Run every fetcher for one ticker and return a dict of source -> item count.
+    Each source is independently best-effort: one failing doesn't stop the others."""
+    results: dict[str, int] = {}
+    results["prices"] = fetch_prices(conn, ticker)
+    results["fundamentals"] = int(fetch_fundamentals(conn, ticker))
+    results["google_news"] = fetch_google_news(conn, ticker, company_name)
+    results["newsapi"] = fetch_newsapi(conn, ticker, company_name)
+    results["reddit"] = fetch_reddit_posts(conn, ticker)
+    return results
+
+
+if __name__ == "__main__":
+    # Quick manual smoke test: fetch everything for the configured watchlist.
+    database.init_db()
+    with database.get_connection() as conn:
+        for tkr in config.WATCHLIST:
+            log.info("Fetching all data for %s...", tkr)
+            summary = fetch_all_for_ticker(conn, tkr)
+            log.info("%s summary: %s", tkr, summary)
+"""
+database.py — SQLite schema and access helpers for StockOracle.
+ 
+Design notes:
+- Raw sqlite3 (no ORM), per the project's tech stack.
+- One connection helper (`get_connection`) that every other function reuses;
+  callers may also open their own connection with the same helper.
+- `init_db()` is idempotent — safe to call on every startup. It only ever
+  creates tables/indexes if they don't already exist; it never drops data.
+- Every table has a `created_at` timestamp defaulting to UTC "now" at
+  insert time, so later modules (backtester, dashboard) can reconstruct
+  "what did we know and when" without look-ahead bias.
+- Insert helpers use `INSERT OR IGNORE` / explicit uniqueness constraints
+  where duplicates are meaningless (e.g. the same price bar fetched twice),
+  so re-running data_fetcher.py is always safe.
+"""
+ 
+from __future__ import annotations
+ 
+import sqlite3
+from contextlib import contextmanager
+from pathlib import Path
+from typing import Any, Iterator, Sequence
+ 
+import config
+ 
+log = config.get_logger(__name__)
+ 
+SCHEMA = """
+CREATE TABLE IF NOT EXISTS prices (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    ticker      TEXT    NOT NULL,
+    date        TEXT    NOT NULL,          -- ISO date, e.g. '2026-09-19'
+    open        REAL    NOT NULL,
+    high        REAL    NOT NULL,
+    low         REAL    NOT NULL,
+    close       REAL    NOT NULL,
+    volume      INTEGER NOT NULL,
+    fetched_at  TEXT    NOT NULL DEFAULT (datetime('now')),
+    UNIQUE(ticker, date)
+);
+ 
+CREATE INDEX IF NOT EXISTS idx_prices_ticker_date ON prices(ticker, date);
+ 
+CREATE TABLE IF NOT EXISTS news (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    ticker      TEXT    NOT NULL,
+    source      TEXT    NOT NULL,          -- 'google_news', 'newsapi', etc.
+    title       TEXT    NOT NULL,
+    url         TEXT    NOT NULL,
+    published_at TEXT,                     -- ISO datetime if the source gave one
+    summary     TEXT,
+    fetched_at  TEXT    NOT NULL DEFAULT (datetime('now')),
+    UNIQUE(ticker, url)
+);
+ 
+CREATE INDEX IF NOT EXISTS idx_news_ticker ON news(ticker);
+ 
+CREATE TABLE IF NOT EXISTS reddit_posts (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    ticker      TEXT    NOT NULL,
+    subreddit   TEXT    NOT NULL,
+    post_id     TEXT    NOT NULL,          -- reddit's own post id, for de-dup
+    title       TEXT    NOT NULL,
+    score       INTEGER,
+    num_comments INTEGER,
+    created_utc TEXT,                      -- ISO datetime of the reddit post
+    url         TEXT,
+    fetched_at  TEXT    NOT NULL DEFAULT (datetime('now')),
+    UNIQUE(post_id)
+);
+ 
+CREATE INDEX IF NOT EXISTS idx_reddit_ticker ON reddit_posts(ticker);
+ 
+CREATE TABLE IF NOT EXISTS fundamentals (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    ticker      TEXT    NOT NULL,
+    date        TEXT    NOT NULL,          -- date the snapshot was taken
+    market_cap  REAL,
+    pe_ratio    REAL,
+    eps         REAL,
+    dividend_yield REAL,
+    sector      TEXT,
+    industry    TEXT,
+    raw_json    TEXT,                      -- full yfinance .info blob, for anything not modeled above
+    fetched_at  TEXT    NOT NULL DEFAULT (datetime('now')),
+    UNIQUE(ticker, date)
+);
+ 
+CREATE TABLE IF NOT EXISTS sentiment_scores (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    ticker      TEXT    NOT NULL,
+    date        TEXT    NOT NULL,
+    source_type TEXT    NOT NULL,          -- 'news' | 'reddit' | 'llm'
+    score       REAL    NOT NULL,          -- normalized -1..1
+    label       TEXT,                      -- e.g. 'positive'/'neutral'/'negative'
+    detail_json TEXT,                      -- model-specific extra info
+    created_at  TEXT    NOT NULL DEFAULT (datetime('now'))
+);
+ 
+CREATE INDEX IF NOT EXISTS idx_sentiment_ticker_date ON sentiment_scores(ticker, date);
+ 
+CREATE TABLE IF NOT EXISTS technical_indicators (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    ticker      TEXT    NOT NULL,
+    date        TEXT    NOT NULL,
+    rsi_14      REAL,
+    macd        REAL,
+    macd_signal REAL,
+    bb_upper    REAL,
+    bb_lower    REAL,
+    sma_50      REAL,
+    sma_200     REAL,
+    created_at  TEXT    NOT NULL DEFAULT (datetime('now')),
+    UNIQUE(ticker, date)
+);
+ 
+CREATE TABLE IF NOT EXISTS predictions (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    ticker      TEXT    NOT NULL,
+    date        TEXT    NOT NULL,
+    model_name  TEXT    NOT NULL,          -- e.g. 'xgboost_v1'
+    probability_up REAL NOT NULL,          -- model's raw probability output
+    fold_id     INTEGER,                   -- walk-forward fold index (NULL for live predictions)
+    created_at  TEXT    NOT NULL DEFAULT (datetime('now')),
+    UNIQUE(ticker, date, model_name)
+);
+ 
+CREATE TABLE IF NOT EXISTS signals (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    ticker      TEXT    NOT NULL,
+    date        TEXT    NOT NULL,
+    signal      TEXT    NOT NULL,          -- 'BUY' | 'SELL' | 'HOLD'
+    confidence  REAL    NOT NULL,          -- 0..1
+    reasoning   TEXT,                      -- short structured reasoning string
+    thesis      TEXT,                      -- full LLM-written thesis (Phase 4)
+    dry_run     INTEGER NOT NULL DEFAULT 1,
+    created_at  TEXT    NOT NULL DEFAULT (datetime('now'))
+);
+ 
+CREATE INDEX IF NOT EXISTS idx_signals_ticker_date ON signals(ticker, date);
+ 
+CREATE TABLE IF NOT EXISTS pipeline_runs (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    started_at  TEXT    NOT NULL DEFAULT (datetime('now')),
+    finished_at TEXT,
+    status      TEXT    NOT NULL DEFAULT 'running',  -- 'running' | 'success' | 'failed'
+    detail      TEXT
+);
+ 
+CREATE TABLE IF NOT EXISTS backtest_results (
+    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+    ticker              TEXT    NOT NULL,
+    model_name          TEXT    NOT NULL,
+    start_date          TEXT    NOT NULL,
+    end_date            TEXT    NOT NULL,
+    train_window_days   INTEGER NOT NULL,
+    test_window_days    INTEGER NOT NULL,
+    transaction_cost_pct REAL   NOT NULL,
+    num_trades          INTEGER NOT NULL,
+    win_rate            REAL,
+    strategy_return_pct REAL    NOT NULL,
+    benchmark_return_pct REAL   NOT NULL,     -- buy-and-hold over the same period
+    max_drawdown_pct    REAL,
+    sharpe_ratio        REAL,
+    detail_json         TEXT,                 -- full equity curve + per-trade log
+    created_at          TEXT    NOT NULL DEFAULT (datetime('now'))
+);
+ 
+CREATE INDEX IF NOT EXISTS idx_backtest_ticker ON backtest_results(ticker);
+"""
+ 
+ 
+@contextmanager
+def get_connection(db_path: Path | str | None = None) -> Iterator[sqlite3.Connection]:
+    """
+    Yield a sqlite3 connection with sane defaults (row factory, foreign keys),
+    committing on clean exit and rolling back on exception. Always closes.
+ 
+    Usage:
+        with get_connection() as conn:
+            conn.execute(...)
+    """
+    path = str(db_path) if db_path is not None else str(config.DB_PATH)
+    conn = sqlite3.connect(path)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA foreign_keys = ON;")
+    try:
+        yield conn
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+ 
+ 
+def init_db(db_path: Path | str | None = None) -> None:
+    """Create all tables/indexes if they don't already exist. Safe to call repeatedly."""
+    with get_connection(db_path) as conn:
+        conn.executescript(SCHEMA)
+        # Migration for DBs created before `fold_id` was added to `predictions`.
+        # SCHEMA above already includes fold_id for brand-new databases (CREATE
+        # TABLE IF NOT EXISTS is a no-op there), so this ALTER TABLE only ever
+        # does real work against a pre-existing predictions table that lacks
+        # the column. Idempotent: swallow "duplicate column name" and re-raise
+        # anything else.
+        try:
+            conn.execute("ALTER TABLE predictions ADD COLUMN fold_id INTEGER")
+        except sqlite3.OperationalError as exc:
+            if "duplicate column name" not in str(exc).lower():
+                raise  # Re-raise real errors; ignore "already exists"
+    log.info("Database initialized at %s", db_path or config.DB_PATH)
+ 
+ 
+# ---------------------------------------------------------------------------
+# Insert helpers
+# ---------------------------------------------------------------------------
+ 
+def insert_price_bar(
+    conn: sqlite3.Connection,
+    ticker: str,
+    date: str,
+    open_: float,
+    high: float,
+    low: float,
+    close: float,
+    volume: int,
+) -> None:
+    conn.execute(
+        """
+        INSERT OR IGNORE INTO prices (ticker, date, open, high, low, close, volume)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+        """,
+        (ticker, date, open_, high, low, close, volume),
+    )
+ 
+ 
+def insert_price_bars(conn: sqlite3.Connection, ticker: str, rows: Sequence[dict[str, Any]]) -> int:
+    """Bulk-insert price bars. Each row dict needs date/open/high/low/close/volume. Returns row count inserted."""
+    conn.executemany(
+        """
+        INSERT OR IGNORE INTO prices (ticker, date, open, high, low, close, volume)
+        VALUES (:ticker, :date, :open, :high, :low, :close, :volume)
+        """,
+        [{**row, "ticker": ticker} for row in rows],
+    )
+    return len(rows)
+ 
+ 
+def insert_news_item(
+    conn: sqlite3.Connection,
+    ticker: str,
+    source: str,
+    title: str,
+    url: str,
+    published_at: str | None = None,
+    summary: str | None = None,
+) -> None:
+    conn.execute(
+        """
+        INSERT OR IGNORE INTO news (ticker, source, title, url, published_at, summary)
+        VALUES (?, ?, ?, ?, ?, ?)
+        """,
+        (ticker, source, title, url, published_at, summary),
+    )
+ 
+ 
+def insert_reddit_post(
+    conn: sqlite3.Connection,
+    ticker: str,
+    subreddit: str,
+    post_id: str,
+    title: str,
+    score: int | None,
+    num_comments: int | None,
+    created_utc: str | None,
+    url: str | None,
+) -> None:
+    conn.execute(
+        """
+        INSERT OR IGNORE INTO reddit_posts
+            (ticker, subreddit, post_id, title, score, num_comments, created_utc, url)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (ticker, subreddit, post_id, title, score, num_comments, created_utc, url),
+    )
+ 
+ 
+def insert_fundamentals(
+    conn: sqlite3.Connection,
+    ticker: str,
+    date: str,
+    market_cap: float | None,
+    pe_ratio: float | None,
+    eps: float | None,
+    dividend_yield: float | None,
+    sector: str | None,
+    industry: str | None,
+    raw_json: str | None,
+) -> None:
+    conn.execute(
+        """
+        INSERT OR IGNORE INTO fundamentals
+            (ticker, date, market_cap, pe_ratio, eps, dividend_yield, sector, industry, raw_json)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (ticker, date, market_cap, pe_ratio, eps, dividend_yield, sector, industry, raw_json),
+    )
+ 
+ 
+def replace_sentiment_score(
+    conn: sqlite3.Connection,
+    ticker: str,
+    date: str,
+    source_type: str,
+    score: float,
+    label: str | None,
+    detail_json: str | None,
+) -> None:
+    """Idempotent write for a daily aggregate sentiment score. `sentiment_scores`
+    has no UNIQUE constraint (it's designed to allow an append-only per-item log
+    in the future), so callers writing one aggregate row per ticker/date/source
+    must clear any prior aggregate for that key first — this does both steps
+    in one call so re-running sentiment.py never accumulates duplicates."""
+    conn.execute(
+        "DELETE FROM sentiment_scores WHERE ticker = ? AND date = ? AND source_type = ?",
+        (ticker, date, source_type),
+    )
+    conn.execute(
+        """
+        INSERT INTO sentiment_scores (ticker, date, source_type, score, label, detail_json)
+        VALUES (?, ?, ?, ?, ?, ?)
+        """,
+        (ticker, date, source_type, score, label, detail_json),
+    )
+ 
+ 
+def upsert_technical_indicators(
+    conn: sqlite3.Connection,
+    ticker: str,
+    date: str,
+    rsi_14: float | None,
+    macd: float | None,
+    macd_signal: float | None,
+    bb_upper: float | None,
+    bb_lower: float | None,
+    sma_50: float | None,
+    sma_200: float | None,
+) -> None:
+    """Insert or update the indicator row for (ticker, date). Uses the table's
+    UNIQUE(ticker, date) constraint so recomputing indicators (e.g. after new
+    price bars arrive) always reflects the latest calculation rather than
+    appending stale duplicates."""
+    conn.execute(
+        """
+        INSERT INTO technical_indicators
+            (ticker, date, rsi_14, macd, macd_signal, bb_upper, bb_lower, sma_50, sma_200)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(ticker, date) DO UPDATE SET
+            rsi_14 = excluded.rsi_14,
+            macd = excluded.macd,
+            macd_signal = excluded.macd_signal,
+            bb_upper = excluded.bb_upper,
+            bb_lower = excluded.bb_lower,
+            sma_50 = excluded.sma_50,
+            sma_200 = excluded.sma_200
+        """,
+        (ticker, date, rsi_14, macd, macd_signal, bb_upper, bb_lower, sma_50, sma_200),
+    )
+ 
+ 
+def get_technical_indicators(conn: sqlite3.Connection, ticker: str, date: str) -> sqlite3.Row | None:
+    return conn.execute(
+        "SELECT * FROM technical_indicators WHERE ticker = ? AND date = ?", (ticker, date)
+    ).fetchone()
+ 
+ 
+def get_latest_sentiment(conn: sqlite3.Connection, ticker: str, source_type: str | None = None) -> list[sqlite3.Row]:
+    """Return the most recent sentiment_scores row(s) for a ticker, optionally
+    filtered to one source_type ('news' | 'reddit' | 'llm')."""
+    if source_type:
+        return conn.execute(
+            """
+            SELECT * FROM sentiment_scores
+            WHERE ticker = ? AND source_type = ?
+            ORDER BY date DESC, created_at DESC LIMIT 1
+            """,
+            (ticker, source_type),
+        ).fetchall()
+    return conn.execute(
+        """
+        SELECT * FROM sentiment_scores
+        WHERE ticker = ? AND date = (SELECT MAX(date) FROM sentiment_scores WHERE ticker = ?)
+        """,
+        (ticker, ticker),
+    ).fetchall()
+ 
+ 
+def get_price_and_indicators(conn: sqlite3.Connection, ticker: str) -> list[sqlite3.Row]:
+    """Return one row per date with price OHLCV joined to that date's technical
+    indicators (LEFT JOIN — early dates before enough history exist will have
+    NULL indicator columns), ordered ascending by date. This is the base table
+    predictor.py and backtester.py build feature matrices from."""
+    return conn.execute(
+        """
+        SELECT p.ticker, p.date, p.open, p.high, p.low, p.close, p.volume,
+               t.rsi_14, t.macd, t.macd_signal, t.bb_upper, t.bb_lower, t.sma_50, t.sma_200
+        FROM prices p
+        LEFT JOIN technical_indicators t ON t.ticker = p.ticker AND t.date = p.date
+        WHERE p.ticker = ?
+        ORDER BY p.date ASC
+        """,
+        (ticker,),
+    ).fetchall()
+ 
+ 
+def get_all_sentiment(conn: sqlite3.Connection, ticker: str) -> list[sqlite3.Row]:
+    """Return every stored sentiment_scores row for a ticker (all dates, all
+    source types), ascending by date. predictor.py pivots this into
+    per-date news/reddit/llm columns for the feature frame. As noted in
+    sentiment.py, this will only have rows for the recent dates news/Reddit
+    were actually fetched for — not a full historical archive."""
+    return conn.execute(
+        "SELECT * FROM sentiment_scores WHERE ticker = ? ORDER BY date ASC", (ticker,)
+    ).fetchall()
+ 
+ 
+def insert_prediction(
+    conn: sqlite3.Connection,
+    ticker: str,
+    date: str,
+    model_name: str,
+    probability_up: float,
+    fold_id: int | None = None,
+) -> None:
+    """Idempotent write for a model's prediction on (ticker, date, model_name).
+    Relies on the table's UNIQUE(ticker, date, model_name) constraint, so
+    re-running the predictor for a date it already scored updates that row
+    in place rather than raising an IntegrityError or piling up duplicates.
+    `fold_id` is the walk-forward fold index that produced this prediction
+    (None for live-pipeline predictions, which aren't tied to a fold)."""
+    conn.execute(
+        """
+        INSERT INTO predictions (ticker, date, model_name, probability_up, fold_id)
+        VALUES (?, ?, ?, ?, ?)
+        ON CONFLICT(ticker, date, model_name) DO UPDATE SET
+            probability_up = excluded.probability_up,
+            fold_id = excluded.fold_id,
+            created_at = datetime('now')
+        """,
+        (ticker, date, model_name, probability_up, fold_id),
+    )
+ 
+ 
+def get_latest_prediction(conn: sqlite3.Connection, ticker: str, model_name: str) -> sqlite3.Row | None:
+    return conn.execute(
+        """
+        SELECT * FROM predictions WHERE ticker = ? AND model_name = ?
+        ORDER BY date DESC, created_at DESC LIMIT 1
+        """,
+        (ticker, model_name),
+    ).fetchone()
+ 
+ 
+def insert_signal(
+    conn: sqlite3.Connection,
+    ticker: str,
+    date: str,
+    signal: str,
+    confidence: float,
+    reasoning: str | None,
+    thesis: str | None = None,
+    dry_run: bool = True,
+) -> int:
+    """Append-only log of decision-engine output — one row per run, kept even
+    across reruns for the same ticker/date, so signals.py's history shows how
+    a call would have changed as new data came in over the course of a day.
+    Returns the new row's id, so callers (llm_analyst.py) can attach a thesis
+    to this exact row later via update_signal_thesis()."""
+    cur = conn.execute(
+        """
+        INSERT INTO signals (ticker, date, signal, confidence, reasoning, thesis, dry_run)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+        """,
+        (ticker, date, signal, confidence, reasoning, thesis, int(dry_run)),
+    )
+    return int(cur.lastrowid)
+ 
+ 
+def get_latest_signal(conn: sqlite3.Connection, ticker: str) -> sqlite3.Row | None:
+    return conn.execute(
+        "SELECT * FROM signals WHERE ticker = ? ORDER BY date DESC, created_at DESC LIMIT 1",
+        (ticker,),
+    ).fetchone()
+ 
+ 
+def update_signal_thesis(conn: sqlite3.Connection, signal_id: int, thesis: str) -> None:
+    """Attach an LLM-written thesis to an already-persisted signal row.
+    llm_analyst.py calls this after decision_engine.py has already written
+    the row — the thesis is a follow-up enrichment step, not part of the
+    original signal decision, so it's a separate write rather than requiring
+    every signal-writer to know about theses."""
+    conn.execute("UPDATE signals SET thesis = ? WHERE id = ?", (thesis, signal_id))
+ 
+ 
+def insert_backtest_result(conn: sqlite3.Connection, result: dict[str, Any]) -> int:
+    """Insert one backtest summary row. `result` keys must match the
+    backtest_results columns (ticker, model_name, start_date, end_date,
+    train_window_days, test_window_days, transaction_cost_pct, num_trades,
+    win_rate, strategy_return_pct, benchmark_return_pct, max_drawdown_pct,
+    sharpe_ratio, detail_json) — detail_json should already be a JSON string.
+    Returns the new row's id."""
+    cur = conn.execute(
+        """
+        INSERT INTO backtest_results (
+            ticker, model_name, start_date, end_date, train_window_days,
+            test_window_days, transaction_cost_pct, num_trades, win_rate,
+            strategy_return_pct, benchmark_return_pct, max_drawdown_pct,
+            sharpe_ratio, detail_json
+        ) VALUES (
+            :ticker, :model_name, :start_date, :end_date, :train_window_days,
+            :test_window_days, :transaction_cost_pct, :num_trades, :win_rate,
+            :strategy_return_pct, :benchmark_return_pct, :max_drawdown_pct,
+            :sharpe_ratio, :detail_json
+        )
+        """,
+        result,
+    )
+    return int(cur.lastrowid)
+ 
+ 
+def get_backtest_results(conn: sqlite3.Connection, ticker: str) -> list[sqlite3.Row]:
+    return conn.execute(
+        "SELECT * FROM backtest_results WHERE ticker = ? ORDER BY created_at DESC", (ticker,)
+    ).fetchall()
+ 
+ 
+def start_pipeline_run(conn: sqlite3.Connection) -> int:
+    """Record the start of a pipeline run and return its id."""
+    cur = conn.execute("INSERT INTO pipeline_runs (status) VALUES ('running')")
+    return int(cur.lastrowid)
+ 
+ 
+def finish_pipeline_run(conn: sqlite3.Connection, run_id: int, status: str, detail: str | None = None) -> None:
+    conn.execute(
+        "UPDATE pipeline_runs SET finished_at = datetime('now'), status = ?, detail = ? WHERE id = ?",
+        (status, detail, run_id),
+    )
+ 
+ 
+# ---------------------------------------------------------------------------
+# Query helpers
+# ---------------------------------------------------------------------------
+ 
+def get_latest_price_date(conn: sqlite3.Connection, ticker: str) -> str | None:
+    """Return the most recent date we have a price bar for, or None if we have nothing yet."""
+    row = conn.execute(
+        "SELECT MAX(date) AS max_date FROM prices WHERE ticker = ?", (ticker,)
+    ).fetchone()
+    return row["max_date"] if row else None
+ 
+ 
+def get_price_history(conn: sqlite3.Connection, ticker: str, limit: int | None = None) -> list[sqlite3.Row]:
+    """Return price bars for a ticker in ascending date order. If `limit` is given,
+    return only the most recent `limit` bars (still ascending)."""
+    if limit is not None:
+        rows = conn.execute(
+            "SELECT * FROM prices WHERE ticker = ? ORDER BY date DESC LIMIT ?",
+            (ticker, limit),
+        ).fetchall()
+        return list(reversed(rows))
+    return conn.execute(
+        "SELECT * FROM prices WHERE ticker = ? ORDER BY date ASC", (ticker,)
+    ).fetchall()
+ 
+ 
+def get_recent_news(conn: sqlite3.Connection, ticker: str, limit: int = 20) -> list[sqlite3.Row]:
+    return conn.execute(
+        "SELECT * FROM news WHERE ticker = ? ORDER BY COALESCE(published_at, fetched_at) DESC LIMIT ?",
+        (ticker, limit),
+    ).fetchall()
+ 
+ 
+def get_recent_reddit_posts(conn: sqlite3.Connection, ticker: str, limit: int = 20) -> list[sqlite3.Row]:
+    return conn.execute(
+        "SELECT * FROM reddit_posts WHERE ticker = ? ORDER BY COALESCE(created_utc, fetched_at) DESC LIMIT ?",
+        (ticker, limit),
+    ).fetchall()
+ 
+ 
+if __name__ == "__main__":
+    # Running `python database.py` directly just (re)initializes the schema.
+    init_db()
+    print(f"Database ready at {config.DB_PATH}")
+ 
+"""
+decision_engine.py — combines predictor.py's probability, sentiment.py's
+scores, and technical.py's indicators into one BUY/SELL/HOLD signal with a
+confidence score and a short structured reasoning string.
+
+Design:
+  - Every input is optional. A ticker might have a trained model and no
+    fresh sentiment, or sentiment but no model trained yet. Each available
+    component contributes a score in [-1, 1] (positive = bullish, negative
+    = bearish), and the final composite is a weighted average over only the
+    components that are actually present — weights are NOT diluted by
+    missing components, so confidence reflects the strength of the evidence
+    that exists, not a penalty for data that hasn't arrived yet.
+  - If NOTHING is available (no model, no sentiment, no technicals), the
+    result is HOLD with confidence 0.0 and reasoning explaining why.
+  - `config.MIN_CONFIDENCE_TO_ACT` is a hard floor: even a clearly bullish
+    or bearish composite becomes HOLD if confidence doesn't clear it. This
+    is the project's stated risk control, not a suggestion.
+  - This module NEVER places trades. It writes a row to the `signals` table
+    and returns it. What happens with a BUY/SELL signal (paper trade, alert,
+    nothing) is entirely up to code outside this module, and `config.DRY_RUN`
+    must be respected by any of it.
+
+Weights (tunable in WEIGHTS below):
+  - prediction (from predictor.py): 0.5
+  - sentiment (mean of news/reddit/llm, from sentiment.py): 0.3
+  - technical (from RSI + MACD state): 0.2
+
+Technical sub-score interpretation, spelled out because it's a judgment
+call: RSI is treated as a mean-reversion signal (low RSI = oversold = mildly
+bullish, high RSI = overbought = mildly bearish) rather than a momentum
+signal. MACD is treated as a momentum signal (MACD above its signal line =
+bullish state). These two philosophies can and will disagree with each
+other — that's intentional; decision_engine averages them rather than
+picking one, and the reasoning string reports both so a human reviewing a
+signal can see where the disagreement came from.
+"""
+
+from __future__ import annotations
+
+import sqlite3
+from datetime import datetime, timezone
+
+import config
+import database
+import predictor
+
+log = config.get_logger(__name__)
+
+WEIGHTS = {
+    "prediction": 0.5,
+    "sentiment": 0.3,
+    "technical": 0.2,
+}
+
+
+def _prediction_component(conn: sqlite3.Connection, ticker: str, horizon_days: int) -> tuple[float, str] | None:
+    """Return (score in [-1,1], description) from the latest stored prediction, or None if unavailable."""
+    row = database.get_latest_prediction(conn, ticker, predictor.model_name_for(ticker, horizon_days))
+    if row is None:
+        return None
+    prob_up = row["probability_up"]
+    score = (prob_up - 0.5) * 2  # rescale 0..1 -> -1..1
+    direction = "bullish" if score > 0 else "bearish" if score < 0 else "neutral"
+    desc = f"ML model: {prob_up:.0%} probability of price rising over next {horizon_days}d ({direction})"
+    return score, desc
+
+
+def _sentiment_component(conn: sqlite3.Connection, ticker: str) -> tuple[float, str] | None:
+    """Return (score in [-1,1], description) averaged over whichever of
+    news/reddit/llm sentiment are available for the most recent date, or
+    None if there's no sentiment data at all."""
+    rows = database.get_latest_sentiment(conn, ticker)
+    if not rows:
+        return None
+    scores = {row["source_type"]: row["score"] for row in rows}
+    avg_score = sum(scores.values()) / len(scores)
+    parts = ", ".join(f"{source}={score:+.2f}" for source, score in scores.items())
+    direction = "positive" if avg_score > 0.1 else "negative" if avg_score < -0.1 else "mixed/neutral"
+    desc = f"Sentiment ({parts}) — overall {direction}"
+    return avg_score, desc
+
+
+def _technical_component(conn: sqlite3.Connection, ticker: str, date: str) -> tuple[float, str] | None:
+    """Return (score in [-1,1], description) from RSI (mean-reversion) and
+    MACD (momentum) state on `date`, averaged over whichever are available.
+    None if neither RSI nor MACD data exists for that date."""
+    row = database.get_technical_indicators(conn, ticker, date)
+    if row is None:
+        return None
+
+    sub_scores = []
+    descs = []
+
+    if row["rsi_14"] is not None:
+        rsi = row["rsi_14"]
+        # Mean-reversion read: RSI 50 is neutral; below 30 = oversold (bullish),
+        # above 70 = overbought (bearish). Linear in between, clipped to [-1, 1].
+        rsi_score = max(-1.0, min(1.0, (50 - rsi) / 30))
+        sub_scores.append(rsi_score)
+        state = "oversold" if rsi < 30 else "overbought" if rsi > 70 else "neutral"
+        descs.append(f"RSI {rsi:.1f} ({state})")
+
+    if row["macd"] is not None and row["macd_signal"] is not None:
+        macd_score = 1.0 if row["macd"] > row["macd_signal"] else -1.0 if row["macd"] < row["macd_signal"] else 0.0
+        sub_scores.append(macd_score)
+        state = "bullish crossover" if macd_score > 0 else "bearish crossover" if macd_score < 0 else "flat"
+        descs.append(f"MACD {state}")
+
+    if not sub_scores:
+        return None
+
+    avg_score = sum(sub_scores) / len(sub_scores)
+    return avg_score, "; ".join(descs)
+
+
+def combine_components(components: dict[str, tuple[float, str]]) -> dict:
+    """
+    Shared decision logic: given whichever of {prediction, sentiment,
+    technical} components are available (each a (score in [-1,1], description)
+    tuple), compute the weighted composite, confidence, and BUY/SELL/HOLD
+    call. Used by generate_signal() for live decisions AND by
+    backtester.py for historical replay, so both paths make decisions the
+    same way — the backtest is only meaningful if it's testing the same
+    logic that runs live.
+
+    Returns {signal, confidence, composite_score, reasoning}.
+    Returns HOLD/confidence 0.0 if `components` is empty.
+    """
+    if not components:
+        return {
+            "signal": "HOLD",
+            "confidence": 0.0,
+            "composite_score": 0.0,
+            "reasoning": "No prediction, sentiment, or technical data available yet — nothing to decide from.",
+        }
+
+    total_weight = sum(WEIGHTS[name] for name in components)
+    composite = sum(WEIGHTS[name] * score for name, (score, _) in components.items()) / total_weight
+    confidence = min(1.0, abs(composite))
+
+    if confidence < config.MIN_CONFIDENCE_TO_ACT:
+        signal = "HOLD"
+    elif composite > 0:
+        signal = "BUY"
+    else:
+        signal = "SELL"
+
+    reasoning_parts = [desc for _, desc in components.values()]
+    missing = [name for name in WEIGHTS if name not in components]
+    if missing:
+        reasoning_parts.append(f"(no {', '.join(missing)} data available — decision based on the rest)")
+    if signal == "HOLD" and confidence < config.MIN_CONFIDENCE_TO_ACT and composite != 0:
+        reasoning_parts.append(
+            f"Composite score {composite:+.2f} did not clear the {config.MIN_CONFIDENCE_TO_ACT:.0%} confidence floor — defaulting to HOLD."
+        )
+
+    return {
+        "signal": signal,
+        "confidence": confidence,
+        "composite_score": composite,
+        "reasoning": " | ".join(reasoning_parts),
+    }
+
+
+def generate_signal(
+    conn: sqlite3.Connection,
+    ticker: str,
+    horizon_days: int = predictor.DEFAULT_HORIZON_DAYS,
+    persist: bool = True,
+) -> dict:
+    """
+    Compute today's BUY/SELL/HOLD signal for `ticker` from whatever
+    prediction/sentiment/technical data is currently available. Writes a row
+    to the `signals` table (unless persist=False, used by backtester.py to
+    replay historical decisions without polluting the live signal log).
+
+    Returns a dict: {ticker, date, signal, confidence, reasoning, components}.
+    """
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
+    latest_price_date = database.get_latest_price_date(conn, ticker)
+    technical_date = latest_price_date or today
+
+    components: dict[str, tuple[float, str]] = {}
+
+    pred = _prediction_component(conn, ticker, horizon_days)
+    if pred is not None:
+        components["prediction"] = pred
+
+    sent = _sentiment_component(conn, ticker)
+    if sent is not None:
+        components["sentiment"] = sent
+
+    tech = _technical_component(conn, ticker, technical_date)
+    if tech is not None:
+        components["technical"] = tech
+
+    decision = combine_components(components)
+
+    result = {
+        "ticker": ticker,
+        "date": today,
+        "signal": decision["signal"],
+        "confidence": decision["confidence"],
+        "reasoning": decision["reasoning"],
+        "composite_score": decision["composite_score"],
+        "components": {name: score for name, (score, _) in components.items()},
+        "signal_id": None,
+    }
+
+    if persist:
+        result["signal_id"] = database.insert_signal(
+            conn, ticker, today, result["signal"], result["confidence"], result["reasoning"], dry_run=config.DRY_RUN
+        )
+
+    log.info("%s signal: %s (confidence=%.2f) — %s", ticker, result["signal"], result["confidence"], result["reasoning"])
+    return result
+
+
+def generate_watchlist_signals(
+    conn: sqlite3.Connection, tickers: list[str] | None = None, horizon_days: int = predictor.DEFAULT_HORIZON_DAYS
+) -> dict[str, dict]:
+    tickers = tickers or config.WATCHLIST
+    results: dict[str, dict] = {}
+    for ticker in tickers:
+        try:
+            results[ticker] = generate_signal(conn, ticker, horizon_days)
+        except Exception as exc:
+            log.error("Unexpected error generating signal for %s: %s", ticker, exc)
+            results[ticker] = {"ticker": ticker, "signal": "HOLD", "confidence": 0.0, "reasoning": f"error: {exc}"}
+    return results
+
+
+if __name__ == "__main__":
+    database.init_db()
+    with database.get_connection() as conn:
+        summary = generate_watchlist_signals(conn)
+        log.info("=== Decision engine summary ===")
+        for ticker, result in summary.items():
+            log.info("%s: %s (confidence=%.2f)", ticker, result["signal"], result["confidence"])
+"""
+llm_analyst.py — turns a decision_engine.py signal into a short, readable,
+written thesis via an LLM (OpenAI, config.LLM_MODEL_DEEP — "gpt-4o" for
+deep reasoning, per the tech stack).
+
+This module does NOT make decisions. decision_engine.py has already decided
+BUY/SELL/HOLD and computed confidence before this module ever runs; all
+llm_analyst.py does is explain that decision in prose a human can read
+quickly, grounded in the same numbers decision_engine used. If the LLM's
+prose ever seems to imply a different call than the signal it was given,
+that's a prompting bug to fix, not a second opinion to trust.
+
+Hard rule enforced here (from the project brief): "Never claim guaranteed
+profit — output is analysis, not financial advice." This is stated
+explicitly in the system prompt below, and every thesis is checked for
+some obviously disqualifying language patterns before being stored —
+belt-and-suspenders, not a substitute for the prompt doing its job.
+
+Best-effort like every other module: no config.OPENAI_API_KEY or no
+`openai` package installed means this is skipped with a warning, and the
+signal that decision_engine.py already wrote and persisted is left exactly
+as it is — a missing thesis is a missing convenience, not a missing signal.
+
+By default, a thesis is only generated for signals in config.THESIS_SIGNALS
+(BUY/SELL) to avoid spending an LLM call explaining a no-conviction HOLD.
+"""
+
+from __future__ import annotations
+
+import sqlite3
+
+import config
+import database
+
+log = config.get_logger(__name__)
+
+SYSTEM_PROMPT = """You are a financial research assistant writing a short
+analyst note. You are explaining a trading signal that has ALREADY been
+computed by a separate quantitative system — you are not deciding it, you
+are narrating the reasoning behind a decision that is given to you.
+
+Hard rules, no exceptions:
+- Never claim or imply a guaranteed, certain, or "sure thing" outcome.
+- This is analysis, not financial advice. Do not tell the reader what they
+  personally should do with their money.
+- Do not invent facts, numbers, or events not present in the data you were given.
+- Stay grounded in the specific numbers provided — do not use generic
+  boilerplate that could apply to any stock.
+- Keep it to 2-4 short paragraphs.
+"""
+
+# Extremely crude, deliberately conservative post-hoc check. This is a
+# backstop, not the primary safeguard (the system prompt above is) — if this
+# ever fires, treat it as a signal the prompt needs tightening, not just a
+# string to filter out.
+_DISQUALIFYING_PHRASES = [
+    "guaranteed", "guarantee", "sure thing", "cannot lose", "can't lose",
+    "risk-free", "will definitely", "certain to",
+]
+
+
+def _build_user_prompt(ticker: str, signal: dict, context: dict) -> str:
+    return f"""Ticker: {ticker}
+Signal: {signal["signal"]} (confidence: {signal["confidence"]:.0%})
+Structured reasoning from the decision engine: {signal["reasoning"]}
+
+Supporting data:
+{context["formatted"]}
+
+Write a short analyst note explaining why the decision engine likely
+reached this {signal["signal"]} call, referencing the specific numbers
+above. End with a one-sentence reminder that this is automated analysis,
+not financial advice, and that DRY_RUN mode means no trade is being placed.
+"""
+
+
+def _gather_context(conn: sqlite3.Connection, ticker: str) -> dict:
+    """Pull the same kind of numbers decision_engine.py used, formatted as
+    plain text for the prompt. Doesn't need to be exhaustive — just grounded."""
+    lines = []
+
+    latest_date = database.get_latest_price_date(conn, ticker)
+    if latest_date:
+        price_row = conn.execute(
+            "SELECT close FROM prices WHERE ticker = ? AND date = ?", (ticker, latest_date)
+        ).fetchone()
+        if price_row:
+            lines.append(f"- Latest close ({latest_date}): ${price_row['close']:.2f}")
+
+        tech_row = database.get_technical_indicators(conn, ticker, latest_date)
+        if tech_row:
+            if tech_row["rsi_14"] is not None:
+                lines.append(f"- RSI(14): {tech_row['rsi_14']:.1f}")
+            if tech_row["macd"] is not None and tech_row["macd_signal"] is not None:
+                lines.append(f"- MACD: {tech_row['macd']:.3f} vs signal {tech_row['macd_signal']:.3f}")
+            if tech_row["sma_50"] is not None:
+                lines.append(f"- SMA(50): ${tech_row['sma_50']:.2f}")
+            if tech_row["sma_200"] is not None:
+                lines.append(f"- SMA(200): ${tech_row['sma_200']:.2f}")
+
+    sentiment_rows = database.get_latest_sentiment(conn, ticker)
+    for row in sentiment_rows:
+        lines.append(f"- {row['source_type'].capitalize()} sentiment: {row['score']:+.2f} ({row['label']})")
+
+    if not lines:
+        lines.append("(no supporting technical/sentiment data was available)")
+
+    return {"formatted": "\n".join(lines)}
+
+
+def _passes_safety_check(text: str) -> bool:
+    lowered = text.lower()
+    return not any(phrase in lowered for phrase in _DISQUALIFYING_PHRASES)
+
+
+def generate_thesis(conn: sqlite3.Connection, ticker: str, signal: dict) -> str | None:
+    """
+    Generate a written thesis for an already-computed `signal` dict (as
+    returned by decision_engine.generate_signal). Returns the thesis text,
+    or None if OPENAI_API_KEY/openai aren't available, the call failed, or
+    the generated text failed the safety check.
+    """
+    if not config.OPENAI_API_KEY:
+        log.warning("OPENAI_API_KEY not set — skipping thesis generation for %s.", ticker)
+        return None
+
+    try:
+        from openai import OpenAI
+    except ImportError:
+        log.warning("openai package not installed — skipping thesis generation for %s. `pip install openai`.", ticker)
+        return None
+
+    context = _gather_context(conn, ticker)
+    user_prompt = _build_user_prompt(ticker, signal, context)
+
+    try:
+        client = OpenAI(api_key=config.OPENAI_API_KEY)
+        response = client.chat.completions.create(
+            model=config.LLM_MODEL_DEEP,
+            messages=[
+                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "user", "content": user_prompt},
+            ],
+            temperature=0.4,
+        )
+        thesis = response.choices[0].message.content.strip()
+    except Exception as exc:
+        log.error("LLM thesis generation failed for %s: %s", ticker, exc)
+        return None
+
+    if not _passes_safety_check(thesis):
+        log.error(
+            "Generated thesis for %s failed the safety check (disqualifying language) — discarding it. "
+            "This should not happen given the system prompt; treat it as a prompt bug.",
+            ticker,
+        )
+        return None
+
+    return thesis
+
+
+def generate_and_store_thesis(conn: sqlite3.Connection, ticker: str, signal: dict) -> str | None:
+    """
+    Generate a thesis for `signal` (as returned by decision_engine.generate_signal,
+    with persist=True so it has a signal_id) and attach it to that exact
+    signal row. Only bothers for signals in config.THESIS_SIGNALS (BUY/SELL
+    by default) — skips HOLD to save the cost of an LLM call explaining
+    "nothing to do right now."
+
+    Returns the thesis text, or None if generation was skipped/failed.
+    """
+    if signal["signal"] not in config.THESIS_SIGNALS:
+        log.info("%s: signal is %s, not in THESIS_SIGNALS %s — skipping thesis.", ticker, signal["signal"], config.THESIS_SIGNALS)
+        return None
+
+    if signal.get("signal_id") is None:
+        log.warning("%s: signal has no signal_id (was it generated with persist=False?) — cannot attach a thesis.", ticker)
+        return None
+
+    thesis = generate_thesis(conn, ticker, signal)
+    if thesis is None:
+        return None
+
+    database.update_signal_thesis(conn, signal["signal_id"], thesis)
+    log.info("Stored thesis for %s (signal_id=%d, %d chars).", ticker, signal["signal_id"], len(thesis))
+    return thesis
+
+
+if __name__ == "__main__":
+    import decision_engine
+
+    database.init_db()
+    with database.get_connection() as conn:
+        for ticker in config.WATCHLIST:
+            sig = decision_engine.generate_signal(conn, ticker)
+            thesis = generate_and_store_thesis(conn, ticker, sig)
+            log.info("%s: %s — thesis %s", ticker, sig["signal"], "generated" if thesis else "skipped")
+"""
+main.py — StockOracle orchestrator.
+
+Phase 1+2+3 scope: fetch raw data into SQLite, compute derived signals
+(sentiment, technical indicators), then train/refresh the ML predictor and
+run the decision engine to produce a BUY/SELL/HOLD call. Backtesting
+(backtester.py) is deliberately NOT part of this live pipeline — it's a
+separate, heavier, offline validation step you run on demand
+(`python backtester.py`) before trusting any signal this produces.
+llm_analyst.py (written thesis), scheduler.py, and dashboard.py are Phase 4.
+
+Usage:
+    python main.py                 # run once for the full watchlist
+    python main.py AAPL MSFT       # run once for specific tickers only
+"""
+
+from __future__ import annotations
+
+import sys
+
+import config
+import data_fetcher
+import database
+import decision_engine
+import predictor
+import sentiment
+import technical
+
+log = config.get_logger(__name__)
+
+# Optional: ticker -> company name, used to improve news-search relevance.
+# Not exhaustive — data_fetcher falls back to the bare ticker if a name
+# isn't listed here.
+COMPANY_NAMES: dict[str, str] = {
+    "AAPL": "Apple",
+    "MSFT": "Microsoft",
+    "NVDA": "Nvidia",
+    "GOOGL": "Alphabet",
+    "AMZN": "Amazon",
+}
+
+
+def run_pipeline(tickers: list[str] | None = None) -> dict[str, dict[str, int]]:
+    """
+    Run one full Phase-1 pipeline pass: fetch prices/fundamentals/news/reddit
+    for each ticker and store them in SQLite. Returns a per-ticker summary of
+    how many items were fetched from each source, for logging/inspection.
+
+    Safe to call repeatedly — all inserts are dedup-safe at the DB layer.
+    """
+    tickers = tickers or config.WATCHLIST
+    database.init_db()
+
+    summary: dict[str, dict[str, int]] = {}
+
+    with database.get_connection() as conn:
+        run_id = database.start_pipeline_run(conn)
+        log.info(
+            "Starting pipeline run #%d for %d ticker(s): %s (DRY_RUN=%s)",
+            run_id,
+            len(tickers),
+            ", ".join(tickers),
+            config.DRY_RUN,
+        )
+
+        try:
+            for ticker in tickers:
+                company_name = COMPANY_NAMES.get(ticker.upper())
+                log.info("--- %s ---", ticker)
+                fetch_counts = data_fetcher.fetch_all_for_ticker(conn, ticker, company_name)
+
+                # Phase 2: turn what we just fetched (plus prior history) into signals.
+                sentiment_results = sentiment.analyze_ticker_sentiment(conn, ticker)
+                technical_count = technical.compute_indicators_for_ticker(conn, ticker)
+
+                # Phase 3: retrain/refresh the predictor and combine everything
+                # into a BUY/SELL/HOLD call via decision_engine. Either can
+                # legitimately have nothing to do yet (not enough history to
+                # train, or no trained model to predict from) — both degrade
+                # to None/HOLD rather than raising, same as every earlier step.
+                train_summary = predictor.train_model(conn, ticker)
+                probability_up = predictor.predict_latest(conn, ticker) if train_summary else None
+                decision = decision_engine.generate_signal(conn, ticker)
+
+                summary[ticker] = {
+                    **fetch_counts,
+                    "sentiment_news": int(sentiment_results["news"]),
+                    "sentiment_reddit": int(sentiment_results["reddit"]),
+                    "sentiment_llm": int(sentiment_results["llm"]),
+                    "technical_dates": technical_count,
+                    "trained": bool(train_summary),
+                    "probability_up": probability_up,
+                    "signal": decision["signal"],
+                    "confidence": decision["confidence"],
+                }
+        except Exception as exc:
+            database.finish_pipeline_run(conn, run_id, status="failed", detail=str(exc))
+            log.error("Pipeline run #%d failed: %s", run_id, exc)
+            raise
+        else:
+            database.finish_pipeline_run(conn, run_id, status="success", detail=None)
+            log.info("Pipeline run #%d finished successfully.", run_id)
+
+    _log_summary(summary)
+    return summary
+
+
+def _log_summary(summary: dict[str, dict[str, int]]) -> None:
+    log.info("=== Pipeline summary ===")
+    for ticker, counts in summary.items():
+        parts = ", ".join(f"{source}={count}" for source, count in counts.items())
+        log.info("%s: %s", ticker, parts)
+
+
+if __name__ == "__main__":
+    requested_tickers = [t.upper() for t in sys.argv[1:]] or None
+    run_pipeline(requested_tickers)
+"""
+predictor.py — machine-learning model predicting P(price up) over a forward
+horizon, from technical + sentiment features.
+Model: XGBoost (per the tech stack) if installed, otherwise a fallback to
+scikit-learn's HistGradientBoostingClassifier — chosen deliberately because,
+like XGBoost, it handles NaN feature values natively (important here: early
+dates lack sma_200, and sentiment coverage is sparse — see module docstring
+in sentiment.py). Whichever backend is used, this module exposes the same
+train/predict interface, and every saved model records which backend
+produced it so predictions are never silently mixed across incompatible
+model files.
+No look-ahead bias:
+  - Every feature at row (ticker, date) is built ONLY from that date's price
+    and technical-indicator values (both already trailing-only by
+    construction — see technical.py) and same-day sentiment.
+  - The label at row (ticker, date) is whether close price horizon_days
+    trading days LATER is higher than close price at date. Using future
+    data to construct a *label* for supervised learning is standard and
+    correct; the discipline that matters is that the *features* at that row
+    never include anything from after date. This module enforces that by
+    construction — it never joins forward-looking columns into the feature
+    set.
+  - The last horizon_days rows of any ticker's history have no valid label
+    (we don't yet know the future close) and are dropped from training.
+Known limitation carried over from sentiment.py: because sentiment_scores
+only has rows for recent dates, sentiment features will be NaN/missing for
+most of history. They're included in the feature set so the model can use
+them when present, but the model should not be expected to lean on them
+until historical sentiment coverage improves.
+This module does NOT decide trading logic — it only produces a probability.
+decision_engine.py (next file) combines this probability with sentiment and
+technical readings into an actual BUY/SELL/HOLD call.
+Dtype safety:
+  XGBoost (and sklearn's HistGradientBoostingClassifier) reject pandas
+  DataFrames containing object / nullable-extension dtypes. Two defensive
+  layers keep the feature matrix clean:
+    1. build_feature_frame() forces the sentiment columns to float64
+       immediately after the pivot/merge, so they can never become
+       pure-object and thus never get silently dropped.
+    2. _sanitize_features() reindexes the matrix to exactly the trained
+       feature list (creating NaNs for any missing column) and coerces
+       everything to float64, replacing ±inf with NaN along the way.
+"""
+from __future__ import annotations
+import json
+import sqlite3
+from datetime import datetime, timezone
+from pathlib import Path
+import config
+import database
+log = config.get_logger(__name__)
+MODELS_DIR = Path(__file__).resolve().parent / "models"
+DEFAULT_HORIZON_DAYS = 5
+MIN_TRAINING_ROWS = 60  # below this, a walk-forward split is meaningless
+FEATURE_COLUMNS = [
+    "rsi_14",
+    "macd",
+    "macd_signal",
+    "macd_hist",
+    "bb_percent",
+    "close_to_sma50",
+    "close_to_sma200",
+    "daily_return",
+    "volume_change",
+    "sentiment_news",
+    "sentiment_reddit",
+    "sentiment_llm",
+]
+# ---------------------------------------------------------------------------
+# Dtype hygiene
+# ---------------------------------------------------------------------------
+def _sanitize_features(X, expected_columns: list[str] | None = None):
+    """
+    Force a clean numeric matrix for XGBoost / sklearn.
+    - If expected_columns is given, reindex X to exactly those columns (in
+      that order). Any missing column is created as NaN and a warning is
+      logged, so train/predict always see the same feature shape.
+    - Coerce every column to float64, killing object / nullable-extension
+      dtypes that XGBoost's pandas mapper can't handle.
+    - Replace ±inf with NaN (XGBoost handles NaN natively; inf crashes it).
+    """
+    import numpy as np
+    import pandas as pd
+    if not isinstance(X, pd.DataFrame):
+        return X
+    if expected_columns is not None:
+        missing = [c for c in expected_columns if c not in X.columns]
+        if missing:
+            log.warning("Feature matrix missing expected columns: %s", missing)
+            for c in missing:
+                X[c] = np.nan
+        # Keep only the expected columns, in the exact order the model was trained with
+        X = X.reindex(columns=expected_columns)
+    # Force pure float64 — this is the key step that kills object /
+    # extension dtypes.
+    X = X.apply(pd.to_numeric, errors="coerce").astype("float64")
+    X = X.replace([np.inf, -np.inf], np.nan)
+    return X
+# ---------------------------------------------------------------------------
+# Model naming / paths
+# ---------------------------------------------------------------------------
+def _model_name(ticker: str, horizon_days: int) -> str:
+    return f"{ticker.upper()}_h{horizon_days}"
+def model_name_for(ticker: str, horizon_days: int) -> str:
+    """Public helper so other modules (decision_engine.py) can look up a
+    ticker's prediction rows via database.get_latest_prediction without
+    duplicating the naming convention."""
+    return _model_name(ticker, horizon_days)
+def _model_path(ticker: str, horizon_days: int) -> Path:
+    return MODELS_DIR / f"{_model_name(ticker, horizon_days)}.joblib"
+# ---------------------------------------------------------------------------
+# Feature construction
+# ---------------------------------------------------------------------------
+def build_feature_frame(conn: sqlite3.Connection, ticker: str):
+    """
+    Build a feature DataFrame (one row per date) for ticker from stored
+    price/indicator/sentiment data. Returns None if pandas isn't installed
+    or there isn't any price history yet.
+    """
+    try:
+        import pandas as pd
+    except ImportError:
+        log.warning("pandas not installed — predictor cannot build features for %s.", ticker)
+        return None
+    rows = database.get_price_and_indicators(conn, ticker)
+    if not rows:
+        log.warning("No price history stored for %s — cannot build features.", ticker)
+        return None
+    df = pd.DataFrame([dict(r) for r in rows])
+    df["date"] = pd.to_datetime(df["date"])
+    df = df.sort_values("date").reset_index(drop=True)
+    # Derived features from stored raw indicators.
+    df["macd_hist"] = df["macd"] - df["macd_signal"]
+    bb_width = df["bb_upper"] - df["bb_lower"]
+    df["bb_percent"] = (df["close"] - df["bb_lower"]) / bb_width  # 0 = at lower band, 1 = at upper band
+    df.loc[bb_width == 0, "bb_percent"] = None
+    df["close_to_sma50"] = (df["close"] - df["sma_50"]) / df["sma_50"]
+    df["close_to_sma200"] = (df["close"] - df["sma_200"]) / df["sma_200"]
+    df["daily_return"] = df["close"].pct_change()
+    df["volume_change"] = df["volume"].pct_change()
+    # Sentiment is a separate, sparse table — left-join it in per date.
+    sentiment_rows = conn.execute(
+        "SELECT date, source_type, score FROM sentiment_scores WHERE ticker = ?", (ticker,)
+    ).fetchall()
+    if sentiment_rows:
+        sent_df = pd.DataFrame([dict(r) for r in sentiment_rows])
+        sent_df["date"] = pd.to_datetime(sent_df["date"])
+        pivot = sent_df.pivot_table(index="date", columns="source_type", values="score", aggfunc="mean")
+        pivot = pivot.rename(columns={"news": "sentiment_news", "reddit": "sentiment_reddit", "llm": "sentiment_llm"})
+        df = df.merge(pivot, on="date", how="left")
+    # Force sentiment columns to exist and be float64 — never let them become
+    # pure-object, which would cause _sanitize_features to drop them.
+    for col in ("sentiment_news", "sentiment_reddit", "sentiment_llm"):
+        if col not in df.columns:
+            df[col] = 0.0
+        df[col] = pd.to_numeric(df[col], errors="coerce").astype("float64")
+    # Same hardening for the numeric price-derived features, in case any
+    # pct_change/NaN arithmetic left them as object.
+    for col in (
+        "rsi_14", "macd", "macd_signal", "macd_hist", "bb_percent",
+        "close_to_sma50", "close_to_sma200", "daily_return", "volume_change",
+    ):
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce").astype("float64")
+    return df
+# ---------------------------------------------------------------------------
+# Backend selection
+# ---------------------------------------------------------------------------
+def _get_model_backend():
+    """Return (backend_name, model_factory) — tries XGBoost first, falls
+    back to sklearn's HistGradientBoostingClassifier (also handles NaN
+    natively, matching XGBoost's behavior on missing indicator/sentiment
+    values)."""
+    try:
+        import xgboost as xgb
+        def factory():
+            return xgb.XGBClassifier(
+                n_estimators=200,
+                max_depth=4,
+                learning_rate=0.05,
+                subsample=0.8,
+                colsample_bytree=0.8,
+                eval_metric="logloss",
+            )
+        return "xgboost", factory
+    except ImportError:
+        pass
+    try:
+        from sklearn.ensemble import HistGradientBoostingClassifier
+        def factory():
+            return HistGradientBoostingClassifier(max_depth=4, learning_rate=0.05, max_iter=200)
+        return "sklearn_hgb", factory
+    except ImportError:
+        return None, None
+# ---------------------------------------------------------------------------
+# Training
+# ---------------------------------------------------------------------------
+def train_model(conn: sqlite3.Connection, ticker: str, horizon_days: int = DEFAULT_HORIZON_DAYS) -> dict | None:
+    """
+    Train (or retrain) a probability-up model for ticker. Reports a quick
+    time-ordered holdout accuracy for diagnostics, then fits a deployment
+    model on the full available history and saves it to disk.
+    Returns a summary dict, or None if training couldn't proceed (missing
+    dependency, insufficient data).
+    """
+    try:
+        import joblib
+    except ImportError:
+        log.warning("joblib not installed — cannot save trained models. pip install joblib.")
+        return None
+    backend_name, factory = _get_model_backend()
+    if factory is None:
+        log.warning(
+            "Neither xgboost nor scikit-learn is installed — cannot train a model for %s.", ticker
+        )
+        return None
+    df = build_feature_frame(conn, ticker)
+    if df is None:
+        return None
+    # Label: did close horizon_days trading days later end up higher?
+    df["future_close"] = df["close"].shift(-horizon_days)
+    df["label"] = (df["future_close"] > df["close"]).astype(int)
+    # Rows with no known future close (the tail of history) can't be trained on.
+    df = df.iloc[:-horizon_days] if horizon_days > 0 else df
+    if len(df) < MIN_TRAINING_ROWS:
+        log.warning(
+            "Only %d usable rows for %s (need >= %d) — skipping training. "
+            "Fetch more price history first (config.PRICE_HISTORY_PERIOD).",
+            len(df), ticker, MIN_TRAINING_ROWS,
+        )
+        return None
+    X = df[FEATURE_COLUMNS]
+    y = df["label"]
+    # Sanitize once — the same cleaned matrix is reused for holdout + final fit.
+    X = _sanitize_features(X, expected_columns=FEATURE_COLUMNS)
+    # Quick time-ordered holdout (last 20%) purely for a diagnostic accuracy
+    # number — this is NOT the walk-forward backtest (that's backtester.py,
+    # which retrains across multiple folds). This is a cheap sanity check.
+    split_idx = int(len(df) * 0.8)
+    X_train, X_holdout = X.iloc[:split_idx], X.iloc[split_idx:]
+    y_train, y_holdout = y.iloc[:split_idx], y.iloc[split_idx:]
+    holdout_accuracy = None
+    if len(X_holdout) > 0 and y_holdout.nunique() > 1:
+        diag_model = factory()
+        diag_model.fit(X_train, y_train)
+        holdout_accuracy = float(diag_model.score(X_holdout, y_holdout))
+        log.info(
+            "%s: holdout accuracy over last %d rows = %.3f (backend=%s)",
+            ticker, len(X_holdout), holdout_accuracy, backend_name,
+        )
+    else:
+        log.warning(
+            "%s: holdout set too small or single-class — skipping diagnostic accuracy.", ticker
+        )
+    # Deployment model: trained on the full dataset, saved to disk.
+    final_model = factory()
+    final_model.fit(X, y)
+    MODELS_DIR.mkdir(parents=True, exist_ok=True)
+    path = _model_path(ticker, horizon_days)
+    joblib.dump(
+        {
+            "backend": backend_name,
+            "ticker": ticker,
+            "horizon_days": horizon_days,
+            "feature_columns": FEATURE_COLUMNS,
+            "trained_at": datetime.now(timezone.utc).isoformat(),
+            "n_rows_trained": len(df),
+            "holdout_accuracy": holdout_accuracy,
+            "model": final_model,
+        },
+        path,
+    )
+    log.info("Saved trained model for %s to %s (backend=%s, rows=%d)", ticker, path, backend_name, len(df))
+    return {
+        "ticker": ticker,
+        "horizon_days": horizon_days,
+        "backend": backend_name,
+        "n_rows_trained": len(df),
+        "holdout_accuracy": holdout_accuracy,
+        "model_path": str(path),
+    }
+# ---------------------------------------------------------------------------
+# Prediction
+# ---------------------------------------------------------------------------
+def predict_latest(conn: sqlite3.Connection, ticker: str, horizon_days: int = DEFAULT_HORIZON_DAYS) -> float | None:
+    """
+    Load the saved model for ticker/horizon_days and predict P(up) for
+    the most recent available date. Stores the prediction in the
+    predictions table. Returns the probability, or None if no model has
+    been trained yet or a dependency is missing.
+    """
+    try:
+        import joblib
+    except ImportError:
+        log.warning("joblib not installed — cannot load trained models.")
+        return None
+    path = _model_path(ticker, horizon_days)
+    if not path.exists():
+        log.warning(
+            "No trained model found for %s at horizon=%d (%s). Call train_model() first.",
+            ticker, horizon_days, path,
+        )
+        return None
+    bundle = joblib.load(path)
+    df = build_feature_frame(conn, ticker)
+    if df is None or df.empty:
+        log.warning("No feature data available for %s — cannot predict.", ticker)
+        return None
+    latest_row = df.iloc[[-1]]
+    X_latest = latest_row[bundle["feature_columns"]]
+    X_latest = _sanitize_features(X_latest, expected_columns=bundle["feature_columns"])
+    try:
+        probability_up = float(bundle["model"].predict_proba(X_latest)[0][1])
+    except Exception as exc:
+        log.error("Prediction failed for %s: %s", ticker, exc)
+        return None
+    latest_date = latest_row["date"].iloc[0].strftime("%Y-%m-%d")
+    model_name = _model_name(ticker, horizon_days)
+    database.insert_prediction(conn, ticker, latest_date, model_name, probability_up)
+    log.info("Predicted P(up over %dd) for %s on %s: %.3f", horizon_days, ticker, latest_date, probability_up)
+    return probability_up
+# ---------------------------------------------------------------------------
+# Watchlist driver
+# ---------------------------------------------------------------------------
+def train_and_predict_watchlist(
+    conn: sqlite3.Connection, tickers: list[str] | None = None, horizon_days: int = DEFAULT_HORIZON_DAYS
+) -> dict[str, float | None]:
+    """Train (or retrain) and predict for every ticker in the watchlist. One
+    ticker's failure doesn't stop the others."""
+    tickers = tickers or config.WATCHLIST
+    results: dict[str, float | None] = {}
+    for ticker in tickers:
+        try:
+            train_summary = train_model(conn, ticker, horizon_days)
+            if train_summary is None:
+                results[ticker] = None
+                continue
+            results[ticker] = predict_latest(conn, ticker, horizon_days)
+        except Exception as exc:
+            log.error("Unexpected error training/predicting for %s: %s", ticker, exc)
+            results[ticker] = None
+    return results
+if __name__ == "__main__":
+    database.init_db()
+    with database.get_connection() as conn:
+        summary = train_and_predict_watchlist(conn)
+        log.info("=== Predictor summary ===")
+        for ticker, prob in summary.items():
+            log.info("%s: P(up) = %s", ticker, prob)
+"""
+scheduler.py — runs main.run_pipeline() on a recurring timer via APScheduler.
+
+This is a thin wrapper, deliberately. All the actual work (fetch, sentiment,
+technical, predict, decide) lives in main.py; scheduler.py's only job is to
+call it on a schedule and keep the process alive. If APScheduler isn't
+installed, this module says so clearly and exits rather than pretending to
+run — there's no meaningful degraded mode for "the thing whose entire job
+is scheduling."
+
+Usage:
+    python scheduler.py                # run forever, every config.PIPELINE_INTERVAL_MINUTES
+    python scheduler.py --once         # run the pipeline once immediately and exit (no scheduling)
+    python scheduler.py --interval 15  # override the interval for this run
+"""
+
+from __future__ import annotations
+
+import argparse
+import sys
+
+import config
+import database
+import llm_analyst
+import main as pipeline_main
+
+log = config.get_logger(__name__)
+
+
+def run_full_cycle(tickers: list[str] | None = None) -> None:
+    """
+    One complete scheduled cycle: run the Phase 1-3 pipeline (fetch, sentiment,
+    technical, predict, decide — see main.run_pipeline), then generate a
+    written thesis for any ticker whose signal landed in config.THESIS_SIGNALS.
+
+    main.run_pipeline() already runs decision_engine and persists each
+    signal, but its summary dict doesn't carry the signal's row id forward.
+    So after the pipeline finishes, we re-fetch each qualifying ticker's
+    just-written signal row (rather than regenerating a fresh signal, which
+    could theoretically differ if data changed mid-run) and attach a thesis
+    to that exact row. This keeps "decide" and "explain" as separable steps
+    — you can run the decision pipeline without ever spending an LLM call on
+    prose, which matters since gpt-4o calls cost real money.
+    """
+    tickers = tickers or config.WATCHLIST
+    summary = pipeline_main.run_pipeline(tickers)
+
+    with database.get_connection() as conn:
+        for ticker, ticker_summary in summary.items():
+            if ticker_summary.get("signal") not in config.THESIS_SIGNALS:
+                continue
+            row = database.get_latest_signal(conn, ticker)
+            if row is None:
+                continue
+            fake_signal = {
+                "signal": row["signal"],
+                "confidence": row["confidence"],
+                "reasoning": row["reasoning"],
+                "signal_id": row["id"],
+            }
+            llm_analyst.generate_and_store_thesis(conn, ticker, fake_signal)
+
+
+def run_once(tickers: list[str] | None = None) -> None:
+    log.info("Running one pipeline cycle immediately (--once).")
+    run_full_cycle(tickers)
+    log.info("One-off cycle complete.")
+
+
+def run_forever(interval_minutes: int, tickers: list[str] | None = None) -> None:
+    try:
+        from apscheduler.schedulers.blocking import BlockingScheduler
+    except ImportError:
+        log.error(
+            "apscheduler is not installed — cannot run on a schedule. "
+            "`pip install apscheduler`, or use `python scheduler.py --once` to run a single cycle without it."
+        )
+        sys.exit(1)
+
+    scheduler = BlockingScheduler()
+    scheduler.add_job(
+        run_full_cycle,
+        "interval",
+        minutes=interval_minutes,
+        kwargs={"tickers": tickers},
+        next_run_time=None,  # don't fire immediately on startup; wait one interval first
+        id="stockoracle_pipeline",
+        max_instances=1,       # never let a slow cycle overlap with the next tick
+        coalesce=True,         # if a tick was missed (process was asleep), run once, not N times
+    )
+    log.info(
+        "StockOracle scheduler started — running every %d minute(s) for %s. Press Ctrl+C to stop. (DRY_RUN=%s)",
+        interval_minutes, ", ".join(tickers or config.WATCHLIST), config.DRY_RUN,
+    )
+    try:
+        scheduler.start()
+    except (KeyboardInterrupt, SystemExit):
+        log.info("Scheduler stopped.")
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Run the StockOracle pipeline on a schedule.")
+    parser.add_argument("--once", action="store_true", help="Run a single pipeline cycle immediately and exit.")
+    parser.add_argument("--interval", type=int, default=config.PIPELINE_INTERVAL_MINUTES, help="Minutes between runs.")
+    parser.add_argument("tickers", nargs="*", help="Optional specific tickers (default: full watchlist).")
+    args = parser.parse_args()
+
+    requested_tickers = [t.upper() for t in args.tickers] or None
+
+    if args.once:
+        run_once(requested_tickers)
+    else:
+        run_forever(args.interval, requested_tickers)
+"""
+sentiment.py — sentiment scoring for stored news headlines and Reddit posts.
+
+Two independent, best-effort scorers:
+  - FinBERT (HuggingFace `ProsusAI/finbert`, via `transformers`) — fast,
+    local, no API cost. Scores each recent news headline and Reddit title
+    individually, then aggregates to one score per ticker/date/source.
+  - LLM (OpenAI, config.LLM_MODEL_CHEAP) — reads all of today's headlines
+    and post titles together and produces one overall sentiment judgement
+    with brief reasoning. More expensive per call, so used for a single
+    daily aggregate rather than per-item scoring.
+
+Both scorers degrade gracefully: if `transformers`/`torch` aren't
+installed, or `config.OPENAI_API_KEY` isn't set, that scorer is skipped
+with a warning — the other can still run, and the pipeline never crashes
+because a sentiment source is unavailable.
+
+Score convention: every score stored in `sentiment_scores.score` is
+normalized to the range -1.0 (very negative) to +1.0 (very positive),
+0.0 being neutral/no signal, regardless of which scorer produced it. This
+lets decision_engine.py (Phase 3) treat all sentiment rows uniformly.
+
+Known limitation: data_fetcher.py only pulls a recent window of news
+(config.NEWS_LOOKBACK_HOURS) and Reddit posts, not a historical archive.
+So sentiment_scores will only ever have rows for recent dates — it is not
+a source of historical sentiment for backtesting arbitrary past dates.
+backtester.py (Phase 3) needs to account for this gap rather than assume
+sentiment features exist everywhere prices do.
+"""
+
+from __future__ import annotations
+
+import json
+import sqlite3
+from datetime import datetime, timezone
+
+import config
+import database
+
+log = config.get_logger(__name__)
+
+# Lazily-loaded, module-level cache so we only pay FinBERT's model-load cost
+# once per process, not once per ticker.
+_finbert_pipeline = None
+_finbert_load_attempted = False
+
+
+def _get_finbert_pipeline():
+    """Return a cached HuggingFace sentiment-analysis pipeline for FinBERT,
+    or None if `transformers`/`torch` aren't installed or loading failed."""
+    global _finbert_pipeline, _finbert_load_attempted
+    if _finbert_load_attempted:
+        return _finbert_pipeline
+
+    _finbert_load_attempted = True
+    try:
+        from transformers import pipeline
+    except ImportError:
+        log.warning("transformers not installed — FinBERT sentiment unavailable. `pip install transformers torch`.")
+        return None
+
+    try:
+        _finbert_pipeline = pipeline("sentiment-analysis", model="ProsusAI/finbert")
+    except Exception as exc:
+        log.error("Failed to load FinBERT model: %s", exc)
+        _finbert_pipeline = None
+
+    return _finbert_pipeline
+
+
+def _finbert_signed_score(label: str, confidence: float) -> float:
+    """Convert FinBERT's (label, confidence) into a single signed score in [-1, 1]."""
+    label = label.lower()
+    if label == "positive":
+        return confidence
+    if label == "negative":
+        return -confidence
+    return 0.0  # neutral carries no directional signal
+
+
+def score_texts_finbert(texts: list[str]) -> list[tuple[float, str, float]]:
+    """
+    Score a list of short texts (headlines/titles) with FinBERT.
+    Returns a list of (signed_score, label, confidence) tuples, same order
+    as input, or an empty list if FinBERT isn't available.
+    """
+    if not texts:
+        return []
+
+    clf = _get_finbert_pipeline()
+    if clf is None:
+        return []
+
+    try:
+        # FinBERT has a token limit; truncate defensively — headlines/titles
+        # are short so this rarely matters in practice.
+        results = clf(texts, truncation=True, max_length=512)
+    except Exception as exc:
+        log.error("FinBERT scoring failed: %s", exc)
+        return []
+
+    out = []
+    for r in results:
+        label = r["label"]
+        confidence = float(r["score"])
+        out.append((_finbert_signed_score(label, confidence), label, confidence))
+    return out
+
+
+def analyze_news_sentiment(conn: sqlite3.Connection, ticker: str, limit: int = 30) -> bool:
+    """Score recent stored news headlines for `ticker` with FinBERT and store
+    one aggregate row (mean of per-item signed scores) for today's date.
+    Returns True if a score was written."""
+    items = database.get_recent_news(conn, ticker, limit=limit)
+    if not items:
+        log.info("No stored news for %s — skipping news sentiment.", ticker)
+        return False
+
+    titles = [row["title"] for row in items if row["title"]]
+    scored = score_texts_finbert(titles)
+    if not scored:
+        return False
+
+    avg_score = sum(s for s, _, _ in scored) / len(scored)
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    detail = {
+        "n_items": len(scored),
+        "labels": [label for _, label, _ in scored],
+    }
+    database.replace_sentiment_score(
+        conn, ticker, today, "news", avg_score,
+        label=_score_to_label(avg_score), detail_json=json.dumps(detail),
+    )
+    log.info("News sentiment for %s: %.3f (from %d headlines)", ticker, avg_score, len(scored))
+    return True
+
+
+def analyze_reddit_sentiment(conn: sqlite3.Connection, ticker: str, limit: int = 30) -> bool:
+    """Score recent stored Reddit post titles for `ticker` with FinBERT and
+    store one aggregate row for today's date. Returns True if written."""
+    items = database.get_recent_reddit_posts(conn, ticker, limit=limit)
+    if not items:
+        log.info("No stored Reddit posts for %s — skipping reddit sentiment.", ticker)
+        return False
+
+    titles = [row["title"] for row in items if row["title"]]
+    scored = score_texts_finbert(titles)
+    if not scored:
+        return False
+
+    avg_score = sum(s for s, _, _ in scored) / len(scored)
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    detail = {
+        "n_items": len(scored),
+        "labels": [label for _, label, _ in scored],
+    }
+    database.replace_sentiment_score(
+        conn, ticker, today, "reddit", avg_score,
+        label=_score_to_label(avg_score), detail_json=json.dumps(detail),
+    )
+    log.info("Reddit sentiment for %s: %.3f (from %d posts)", ticker, avg_score, len(scored))
+    return True
+
+
+def analyze_llm_sentiment(conn: sqlite3.Connection, ticker: str, news_limit: int = 15, reddit_limit: int = 15) -> bool:
+    """
+    Ask an LLM (config.LLM_MODEL_CHEAP) to read today's headlines + Reddit
+    titles together and give one overall sentiment score + short reasoning.
+    Requires config.OPENAI_API_KEY. Returns True if a score was written.
+    """
+    if not config.OPENAI_API_KEY:
+        log.warning("OPENAI_API_KEY not set — skipping LLM sentiment for %s.", ticker)
+        return False
+
+    try:
+        from openai import OpenAI
+    except ImportError:
+        log.warning("openai package not installed — skipping LLM sentiment for %s. `pip install openai`.", ticker)
+        return False
+
+    news_items = database.get_recent_news(conn, ticker, limit=news_limit)
+    reddit_items = database.get_recent_reddit_posts(conn, ticker, limit=reddit_limit)
+    if not news_items and not reddit_items:
+        log.info("No stored news or Reddit posts for %s — skipping LLM sentiment.", ticker)
+        return False
+
+    headlines = "\n".join(f"- {row['title']}" for row in news_items)
+    reddit_titles = "\n".join(f"- {row['title']}" for row in reddit_items)
+
+    prompt = f"""You are a financial sentiment analyst. Read the following recent
+headlines and Reddit post titles about {ticker} and judge the OVERALL
+market sentiment they convey.
+
+News headlines:
+{headlines or "(none)"}
+
+Reddit post titles:
+{reddit_titles or "(none)"}
+
+Respond with ONLY a JSON object, no other text, in exactly this shape:
+{{"score": <float from -1.0 (very negative) to 1.0 (very positive)>,
+  "label": "<positive|neutral|negative>",
+  "reasoning": "<one or two sentence explanation>"}}
+"""
+
+    try:
+        client = OpenAI(api_key=config.OPENAI_API_KEY)
+        response = client.chat.completions.create(
+            model=config.LLM_MODEL_CHEAP,
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.0,
+        )
+        raw = response.choices[0].message.content.strip()
+        raw = raw.removeprefix("```json").removeprefix("```").removesuffix("```").strip()
+        parsed = json.loads(raw)
+        score = float(parsed["score"])
+        label = parsed.get("label", _score_to_label(score))
+        reasoning = parsed.get("reasoning", "")
+    except Exception as exc:
+        log.error("LLM sentiment call failed for %s: %s", ticker, exc)
+        return False
+
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    database.replace_sentiment_score(
+        conn, ticker, today, "llm", score, label=label,
+        detail_json=json.dumps({"reasoning": reasoning, "model": config.LLM_MODEL_CHEAP}),
+    )
+    log.info("LLM sentiment for %s: %.3f (%s) — %s", ticker, score, label, reasoning)
+    return True
+
+
+def _score_to_label(score: float) -> str:
+    if score > 0.15:
+        return "positive"
+    if score < -0.15:
+        return "negative"
+    return "neutral"
+
+
+def analyze_ticker_sentiment(conn: sqlite3.Connection, ticker: str) -> dict[str, bool]:
+    """Run all available sentiment scorers for one ticker. Each is independent —
+    one being unavailable doesn't block the others. Returns which ones wrote a score."""
+    return {
+        "news": analyze_news_sentiment(conn, ticker),
+        "reddit": analyze_reddit_sentiment(conn, ticker),
+        "llm": analyze_llm_sentiment(conn, ticker),
+    }
+
+
+def analyze_watchlist_sentiment(conn: sqlite3.Connection, tickers: list[str] | None = None) -> dict[str, dict[str, bool]]:
+    tickers = tickers or config.WATCHLIST
+    results: dict[str, dict[str, bool]] = {}
+    for ticker in tickers:
+        try:
+            results[ticker] = analyze_ticker_sentiment(conn, ticker)
+        except Exception as exc:
+            log.error("Unexpected error analyzing sentiment for %s: %s", ticker, exc)
+            results[ticker] = {"news": False, "reddit": False, "llm": False}
+    return results
+
+
+if __name__ == "__main__":
+    database.init_db()
+    with database.get_connection() as conn:
+        summary = analyze_watchlist_sentiment(conn)
+        log.info("=== Sentiment summary ===")
+        for ticker, result in summary.items():
+            log.info("%s: %s", ticker, result)
+"""
+sma_baseline.py
+
+Implements a classic 50/200-day SMA crossover ("Golden Cross / Death Cross")
+backtest for every ticker in config.WATCHLIST, using the same price data,
+date range, and transaction cost assumptions as the ML backtest, so the two
+are directly comparable.
+
+Strategy logic (long/flat, no shorting):
+    - Start in cash.
+    - When SMA(50) crosses above SMA(200) and we are in cash -> buy at the
+      *next* bar's open (avoids look-ahead bias: the crossover is only known
+      after today's close, so the earliest we can act is tomorrow's open).
+    - When SMA(50) crosses below SMA(200) and we are long -> sell at the
+      next bar's open.
+    - Transaction costs (config.TRANSACTION_COST_PCT) are applied on both
+      the buy and the sell, modeled as slippage on the execution price.
+    - Any open position is marked-to-market daily and force-closed at the
+      end of the test window (at the final close) so total_return_pct
+      reflects a fully realized result.
+
+Results are written to backtests/sma_baseline_results.json as
+{ticker: metrics_dict}, and a summary table is printed to stdout.
+"""
+
+from __future__ import annotations
+
+import json
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+
+import config
+from database import get_connection, get_price_history
+
+logger = config.get_logger(__name__)
+
+SMA_FAST = 50
+SMA_SLOW = 200
+TRADING_DAYS_PER_YEAR = 252
+OUTPUT_PATH = Path("backtests") / "sma_baseline_results.json"
+
+
+def _max_drawdown_pct(equity_curve: pd.Series) -> float:
+    """Largest peak-to-trough decline in an equity curve, as a positive percentage."""
+    if equity_curve.empty:
+        return 0.0
+    running_max = equity_curve.cummax()
+    drawdown = (equity_curve - running_max) / running_max
+    return float(drawdown.min() * 100.0)
+
+
+def _sharpe_ratio(daily_returns: pd.Series) -> float:
+    """Annualized Sharpe ratio from a series of daily equity returns (rf = 0)."""
+    if daily_returns.empty or daily_returns.std(ddof=0) == 0 or daily_returns.isna().all():
+        return 0.0
+    mean = daily_returns.mean()
+    std = daily_returns.std(ddof=0)
+    if std == 0 or np.isnan(std):
+        return 0.0
+    return float(np.sqrt(TRADING_DAYS_PER_YEAR) * mean / std)
+
+
+def _run_single_ticker(ticker: str, raw_rows) -> dict | None:
+    """Simulate the SMA 50/200 crossover strategy for one ticker's OHLCV history."""
+    if raw_rows is None or len(raw_rows) == 0:
+        logger.warning("No price history for %s, skipping.", ticker)
+        return None
+
+    # DB helper returns a list of sqlite3.Row — convert to DataFrame
+    df = pd.DataFrame([dict(r) for r in raw_rows])
+
+    df = df.sort_values("date").reset_index(drop=True).copy()
+
+    required_cols = {"date", "open", "close"}
+    if not required_cols.issubset(df.columns):
+        logger.warning(
+            "Price history for %s missing required columns %s, skipping.",
+            ticker,
+            required_cols - set(df.columns),
+        )
+        return None
+
+    df["sma_fast"] = df["close"].rolling(window=SMA_FAST, min_periods=SMA_FAST).mean()
+    df["sma_slow"] = df["close"].rolling(window=SMA_SLOW, min_periods=SMA_SLOW).mean()
+
+    # Only consider bars where both SMAs are defined (i.e. after bar 200).
+    tradeable = df[df["sma_slow"].notna()].copy()
+    if tradeable.empty or len(tradeable) < 2:
+        logger.warning(
+            "Not enough history for %s to compute SMA(%d)/SMA(%d) crossovers, skipping.",
+            ticker,
+            SMA_FAST,
+            SMA_SLOW,
+        )
+        return None
+
+    tradeable = tradeable.reset_index(drop=True)
+    tradeable["signal"] = np.where(tradeable["sma_fast"] > tradeable["sma_slow"], 1, 0)
+    # Crossover happens on the bar where the signal changes vs. the prior bar.
+    tradeable["signal_prev"] = tradeable["signal"].shift(1)
+
+    cost = config.TRANSACTION_COST_PCT
+
+    position = 0  # 0 = cash, 1 = long
+    shares = 0.0
+    cash = 1.0  # start with $1 of capital
+    entry_price = None
+    trades: list[dict] = []
+    equity_curve: list[float] = []
+    dates: list = []
+    invested_days = 0
+    n_tradeable_bars = len(tradeable)
+
+    for i in range(n_tradeable_bars):
+        row = tradeable.iloc[i]
+        date = row["date"]
+
+        # Detect crossover using prior bar's signal vs. current bar's signal.
+        # We only know the crossover as of *this* bar's close, so execution
+        # happens at the *next* bar's open (i + 1), never at this bar's own
+        # open or close -> no look-ahead bias.
+        if i > 0 and not pd.isna(row["signal_prev"]):
+            golden_cross = row["signal"] == 1 and row["signal_prev"] == 0
+            death_cross = row["signal"] == 0 and row["signal_prev"] == 1
+
+            if golden_cross and position == 0 and i + 1 < n_tradeable_bars:
+                next_open = tradeable.iloc[i + 1]["open"]
+                exec_price = next_open * (1 + cost)
+                shares = cash / exec_price
+                cash = 0.0
+                position = 1
+                entry_price = exec_price
+                entry_date = tradeable.iloc[i + 1]["date"]
+
+            elif death_cross and position == 1 and i + 1 < n_tradeable_bars:
+                next_open = tradeable.iloc[i + 1]["open"]
+                exec_price = next_open * (1 - cost)
+                cash = shares * exec_price
+                trade_return = (exec_price - entry_price) / entry_price
+                trades.append(
+                    {
+                        "entry_date": str(entry_date),
+                        "exit_date": str(tradeable.iloc[i + 1]["date"]),
+                        "entry_price": float(entry_price),
+                        "exit_price": float(exec_price),
+                        "return_pct": float(trade_return * 100.0),
+                    }
+                )
+                shares = 0.0
+                position = 0
+                entry_price = None
+
+        # Mark-to-market equity for this bar's close.
+        if position == 1:
+            mtm_equity = shares * row["close"]
+            invested_days += 1
+        else:
+            mtm_equity = cash
+        equity_curve.append(mtm_equity)
+        dates.append(date)
+
+    # Force-close any open position at the final close so returns are fully realized.
+    if position == 1:
+        final_close = tradeable.iloc[-1]["close"]
+        exec_price = final_close * (1 - cost)
+        cash = shares * exec_price
+        trade_return = (exec_price - entry_price) / entry_price
+        trades.append(
+            {
+                "entry_date": str(entry_date),
+                "exit_date": str(tradeable.iloc[-1]["date"]) + " (forced close, end of window)",
+                "entry_price": float(entry_price),
+                "exit_price": float(exec_price),
+                "return_pct": float(trade_return * 100.0),
+            }
+        )
+        equity_curve[-1] = cash
+        position = 0
+        shares = 0.0
+
+    equity_series = pd.Series(equity_curve, index=pd.to_datetime(dates))
+    daily_returns = equity_series.pct_change().dropna()
+
+    n_trades = len(trades)
+    win_rate = (
+        float(sum(1 for t in trades if t["return_pct"] > 0) / n_trades) if n_trades > 0 else 0.0
+    )
+    total_return_pct = float((equity_series.iloc[-1] - 1.0) * 100.0) if not equity_series.empty else 0.0
+
+    first_close = tradeable.iloc[0]["close"]
+    last_close = tradeable.iloc[-1]["close"]
+    buy_hold_return_pct = float((last_close - first_close) / first_close * 100.0)
+
+    max_dd = _max_drawdown_pct(equity_series)
+    sharpe = _sharpe_ratio(daily_returns)
+    exposure_pct = float(invested_days / n_tradeable_bars * 100.0) if n_tradeable_bars > 0 else 0.0
+
+    metrics = {
+        "ticker": ticker,
+        "strategy": "SMA_50_200_CROSSOVER",
+        "start_date": str(tradeable.iloc[0]["date"]),
+        "end_date": str(tradeable.iloc[-1]["date"]),
+        "n_bars": int(n_tradeable_bars),
+        "n_trades": int(n_trades),
+        "win_rate": win_rate,
+        "total_return_pct": total_return_pct,
+        "buy_hold_return_pct": buy_hold_return_pct,
+        "max_drawdown_pct": max_dd,
+        "sharpe_ratio": sharpe,
+        "exposure_pct": exposure_pct,
+        "trades": trades,
+    }
+    return metrics
+
+
+def run_sma_baseline() -> dict:
+    """Run the SMA crossover backtest for every ticker in the watchlist."""
+    results: dict[str, dict] = {}
+
+    with get_connection() as conn:
+        for ticker in config.WATCHLIST:
+            logger.info("Running SMA(%d/%d) baseline for %s...", SMA_FAST, SMA_SLOW, ticker)
+            try:
+                df = get_price_history(conn, ticker)
+            except Exception:
+                logger.exception("Failed to load price history for %s", ticker)
+                continue
+
+            metrics = _run_single_ticker(ticker, df)
+            if metrics is not None:
+                results[ticker] = metrics
+
+    OUTPUT_PATH.parent.mkdir(parents=True, exist_ok=True)
+    with open(OUTPUT_PATH, "w") as f:
+        json.dump(results, f, indent=2, default=str)
+    logger.info("Saved SMA baseline results to %s", OUTPUT_PATH)
+
+    return results
+
+
+def print_summary(results: dict) -> None:
+    """Print a summary table of the SMA baseline results."""
+    header = (
+        f"{'Ticker':<8}{'Return':>10}{'B&H':>10}{'Trades':>8}"
+        f"{'Win%':>8}{'Sharpe':>9}{'MaxDD':>9}{'Exposure':>10}"
+    )
+    print("\n" + "=" * len(header))
+    print("SMA 50/200 CROSSOVER BASELINE — SUMMARY")
+    print("=" * len(header))
+    print(header)
+    print("-" * len(header))
+
+    for ticker, m in results.items():
+        print(
+            f"{ticker:<8}"
+            f"{m['total_return_pct']:>9.1f}%"
+            f"{m['buy_hold_return_pct']:>9.1f}%"
+            f"{m['n_trades']:>8}"
+            f"{m['win_rate'] * 100:>7.1f}%"
+            f"{m['sharpe_ratio']:>9.2f}"
+            f"{m['max_drawdown_pct']:>8.1f}%"
+            f"{m['exposure_pct']:>9.1f}%"
+        )
+    print("=" * len(header) + "\n")
+
+
+if __name__ == "__main__":
+    results = run_sma_baseline()
+    print_summary(results)
+"""
+technical.py — technical indicators computed from stored price history.
+
+Uses the `ta` library (pure pandas/numpy under the hood, no C extensions)
+per the project's tech stack. Indicators computed:
+  - RSI(14)
+  - MACD line + signal line (12/26/9, ta's defaults)
+  - Bollinger Bands (20-period, 2 std dev) upper/lower
+  - SMA(50), SMA(200)
+
+Design notes:
+  - Indicators are computed over the *entire* stored price history for a
+    ticker, not just the latest bar, and every date's row is upserted into
+    `technical_indicators`. This matters for Phase 3's backtester: a
+    walk-forward backtest needs the indicator value *as it would have been
+    known* on each historical date, not just today's snapshot.
+  - Early dates (fewer than 200 bars of history) will have NULL sma_200,
+    NULL bb_*, etc. wherever `ta` can't yet compute a value — this is
+    correct and expected, not a bug. Callers (predictor.py, decision_engine.py)
+    must handle NULLs rather than assume every row is fully populated.
+  - Like data_fetcher.py, this module never crashes on a missing dependency:
+    if `ta` or `pandas` aren't installed, it logs a warning and returns
+    without writing anything.
+  - No look-ahead bias: every indicator here is computed using only that
+    row's date and prior rows (standard trailing technical-indicator math).
+    Nothing here peeks at future price bars.
+"""
+
+from __future__ import annotations
+
+import sqlite3
+
+import config
+import database
+
+log = config.get_logger(__name__)
+
+# Minimum number of price bars required before we even attempt indicator
+# calculation. Below this, RSI/MACD/Bollinger are too noisy to be meaningful.
+MIN_BARS_REQUIRED = 20
+
+
+def _compute_with_ta_library(df, ta_module) -> None:
+    """Populate indicator columns on `df` using the `ta` library. Mutates df in place."""
+    df["rsi_14"] = ta_module.momentum.RSIIndicator(close=df["close"], window=14).rsi()
+
+    macd_calc = ta_module.trend.MACD(close=df["close"])
+    df["macd"] = macd_calc.macd()
+    df["macd_signal"] = macd_calc.macd_signal()
+
+    bb = ta_module.volatility.BollingerBands(close=df["close"], window=20, window_dev=2)
+    df["bb_upper"] = bb.bollinger_hband()
+    df["bb_lower"] = bb.bollinger_lband()
+
+    df["sma_50"] = ta_module.trend.SMAIndicator(close=df["close"], window=50).sma_indicator()
+    df["sma_200"] = ta_module.trend.SMAIndicator(close=df["close"], window=200).sma_indicator()
+
+
+def _compute_with_pandas_fallback(df) -> None:
+    """
+    Populate indicator columns on `df` using plain pandas math, for
+    environments where the `ta` package isn't installed. Formulas match
+    `ta`'s defaults (Wilder's smoothing for RSI, EMA 12/26/9 for MACD,
+    20-period/2-std Bollinger Bands) closely enough for research purposes.
+    Mutates df in place. Trailing-only — no look-ahead.
+    """
+    close = df["close"]
+
+    # RSI(14), Wilder's smoothing (matches `ta`'s RSIIndicator).
+    delta = close.diff()
+    gain = delta.clip(lower=0)
+    loss = -delta.clip(upper=0)
+    avg_gain = gain.ewm(alpha=1 / 14, min_periods=14, adjust=False).mean()
+    avg_loss = loss.ewm(alpha=1 / 14, min_periods=14, adjust=False).mean()
+    rs = avg_gain / avg_loss
+    df["rsi_14"] = 100 - (100 / (1 + rs))
+    df.loc[avg_loss == 0, "rsi_14"] = 100.0
+
+    # MACD(12, 26, 9)
+    ema_12 = close.ewm(span=12, adjust=False).mean()
+    ema_26 = close.ewm(span=26, adjust=False).mean()
+    macd_line = ema_12 - ema_26
+    df["macd"] = macd_line
+    df["macd_signal"] = macd_line.ewm(span=9, adjust=False).mean()
+
+    # Bollinger Bands (20, 2 std)
+    sma_20 = close.rolling(window=20, min_periods=20).mean()
+    std_20 = close.rolling(window=20, min_periods=20).std(ddof=0)
+    df["bb_upper"] = sma_20 + 2 * std_20
+    df["bb_lower"] = sma_20 - 2 * std_20
+
+    # SMAs
+    df["sma_50"] = close.rolling(window=50, min_periods=50).mean()
+    df["sma_200"] = close.rolling(window=200, min_periods=200).mean()
+
+
+def compute_indicators_for_ticker(conn: sqlite3.Connection, ticker: str) -> int:
+    """
+    Load all stored price history for `ticker`, compute indicators for every
+    date, and upsert them into `technical_indicators`. Returns the number of
+    dates written (0 if there wasn't enough data or pandas was missing).
+
+    Uses the `ta` library if installed; otherwise falls back to an
+    equivalent pure-pandas implementation so this module works even in a
+    fresh environment before `pip install ta` has been run.
+    """
+    try:
+        import pandas as pd
+    except ImportError:
+        log.warning("pandas not installed — skipping technical indicators for %s.", ticker)
+        return 0
+
+    rows = database.get_price_history(conn, ticker)
+    if len(rows) < MIN_BARS_REQUIRED:
+        log.warning(
+            "Only %d price bars stored for %s (need >= %d) — skipping indicators.",
+            len(rows), ticker, MIN_BARS_REQUIRED,
+        )
+        return 0
+
+    df = pd.DataFrame([dict(r) for r in rows])
+    df["date"] = pd.to_datetime(df["date"])
+    df = df.sort_values("date").reset_index(drop=True)
+
+    try:
+        import ta as ta_module
+        _compute_with_ta_library(df, ta_module)
+    except ImportError:
+        log.warning("`ta` not installed for %s — using built-in pandas fallback formulas.", ticker)
+        _compute_with_pandas_fallback(df)
+    except Exception as exc:
+        log.error("Failed computing indicators for %s via `ta`: %s", ticker, exc)
+        return 0
+
+    # pandas/NaN -> Python None so sqlite stores real NULLs, not the string "nan"
+    df = df.where(pd.notna(df), None)
+
+    written = 0
+    for _, row in df.iterrows():
+        database.upsert_technical_indicators(
+            conn,
+            ticker=ticker,
+            date=row["date"].strftime("%Y-%m-%d"),
+            rsi_14=row["rsi_14"],
+            macd=row["macd"],
+            macd_signal=row["macd_signal"],
+            bb_upper=row["bb_upper"],
+            bb_lower=row["bb_lower"],
+            sma_50=row["sma_50"],
+            sma_200=row["sma_200"],
+        )
+        written += 1
+
+    log.info("Computed and stored indicators for %s across %d dates.", ticker, written)
+    return written
+
+
+def compute_indicators_for_watchlist(conn: sqlite3.Connection, tickers: list[str] | None = None) -> dict[str, int]:
+    """Run compute_indicators_for_ticker for every ticker in the watchlist (or
+    the given list). One ticker's failure doesn't stop the others."""
+    tickers = tickers or config.WATCHLIST
+    results: dict[str, int] = {}
+    for ticker in tickers:
+        try:
+            results[ticker] = compute_indicators_for_ticker(conn, ticker)
+        except Exception as exc:
+            log.error("Unexpected error computing indicators for %s: %s", ticker, exc)
+            results[ticker] = 0
+    return results
+
+
+if __name__ == "__main__":
+    database.init_db()
+    with database.get_connection() as conn:
+        summary = compute_indicators_for_watchlist(conn)
+        log.info("=== Technical indicator summary ===")
+        for ticker, count in summary.items():
+            log.info("%s: %d dates written", ticker, count)

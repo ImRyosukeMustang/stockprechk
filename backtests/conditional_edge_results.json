@@ -1,0 +1,244 @@
+{
+  "tickers": {
+    "AAPL": {
+      "buckets": [
+        {
+          "bucket": "0.50-0.55",
+          "avg_return": -0.381,
+          "median_return": 0.4441,
+          "hit_rate": 53.7,
+          "n": 54
+        },
+        {
+          "bucket": "0.55-0.60",
+          "avg_return": 0.5963,
+          "median_return": 1.0217,
+          "hit_rate": 57.45,
+          "n": 47
+        },
+        {
+          "bucket": "0.60-0.65",
+          "avg_return": 0.6101,
+          "median_return": 1.6452,
+          "hit_rate": 62.86,
+          "n": 35
+        },
+        {
+          "bucket": "0.65-0.70",
+          "avg_return": 0.3789,
+          "median_return": 0.1314,
+          "hit_rate": 53.85,
+          "n": 39
+        },
+        {
+          "bucket": "0.70+",
+          "avg_return": 0.2496,
+          "median_return": 0.1371,
+          "hit_rate": 51.88,
+          "n": 133
+        }
+      ],
+      "total_samples": 308
+    },
+    "MSFT": {
+      "buckets": [
+        {
+          "bucket": "0.50-0.55",
+          "avg_return": 0.0057,
+          "median_return": -0.148,
+          "hit_rate": 50.0,
+          "n": 38
+        },
+        {
+          "bucket": "0.55-0.60",
+          "avg_return": -0.0101,
+          "median_return": -0.3012,
+          "hit_rate": 47.37,
+          "n": 38
+        },
+        {
+          "bucket": "0.60-0.65",
+          "avg_return": 0.6011,
+          "median_return": 0.4627,
+          "hit_rate": 65.0,
+          "n": 40
+        },
+        {
+          "bucket": "0.65-0.70",
+          "avg_return": 0.6377,
+          "median_return": 1.1523,
+          "hit_rate": 65.31,
+          "n": 49
+        },
+        {
+          "bucket": "0.70+",
+          "avg_return": 0.1718,
+          "median_return": 0.3164,
+          "hit_rate": 54.18,
+          "n": 275
+        }
+      ],
+      "total_samples": 440
+    },
+    "NVDA": {
+      "buckets": [
+        {
+          "bucket": "0.50-0.55",
+          "avg_return": 1.1418,
+          "median_return": 0.8943,
+          "hit_rate": 59.26,
+          "n": 54
+        },
+        {
+          "bucket": "0.55-0.60",
+          "avg_return": 1.765,
+          "median_return": 1.0863,
+          "hit_rate": 67.44,
+          "n": 43
+        },
+        {
+          "bucket": "0.60-0.65",
+          "avg_return": 2.0786,
+          "median_return": 2.0959,
+          "hit_rate": 65.08,
+          "n": 63
+        },
+        {
+          "bucket": "0.65-0.70",
+          "avg_return": 0.6725,
+          "median_return": -0.3791,
+          "hit_rate": 48.33,
+          "n": 60
+        },
+        {
+          "bucket": "0.70+",
+          "avg_return": 1.7866,
+          "median_return": 1.5727,
+          "hit_rate": 60.26,
+          "n": 380
+        }
+      ],
+      "total_samples": 600
+    },
+    "GOOGL": {
+      "buckets": [
+        {
+          "bucket": "0.50-0.55",
+          "avg_return": 0.2318,
+          "median_return": 0.9665,
+          "hit_rate": 56.1,
+          "n": 41
+        },
+        {
+          "bucket": "0.55-0.60",
+          "avg_return": 0.9098,
+          "median_return": 1.6404,
+          "hit_rate": 64.81,
+          "n": 54
+        },
+        {
+          "bucket": "0.60-0.65",
+          "avg_return": 0.2519,
+          "median_return": 0.2201,
+          "hit_rate": 50.82,
+          "n": 61
+        },
+        {
+          "bucket": "0.65-0.70",
+          "avg_return": 0.7713,
+          "median_return": 1.0402,
+          "hit_rate": 56.6,
+          "n": 53
+        },
+        {
+          "bucket": "0.70+",
+          "avg_return": 0.2878,
+          "median_return": 0.3191,
+          "hit_rate": 52.03,
+          "n": 271
+        }
+      ],
+      "total_samples": 480
+    },
+    "AMZN": {
+      "buckets": [
+        {
+          "bucket": "0.50-0.55",
+          "avg_return": -0.3949,
+          "median_return": 0.206,
+          "hit_rate": 50.94,
+          "n": 53
+        },
+        {
+          "bucket": "0.55-0.60",
+          "avg_return": 0.2002,
+          "median_return": 0.03,
+          "hit_rate": 51.06,
+          "n": 47
+        },
+        {
+          "bucket": "0.60-0.65",
+          "avg_return": 1.3783,
+          "median_return": 0.7849,
+          "hit_rate": 63.64,
+          "n": 44
+        },
+        {
+          "bucket": "0.65-0.70",
+          "avg_return": -0.963,
+          "median_return": -0.0159,
+          "hit_rate": 48.78,
+          "n": 41
+        },
+        {
+          "bucket": "0.70+",
+          "avg_return": 0.5564,
+          "median_return": 0.6801,
+          "hit_rate": 58.78,
+          "n": 296
+        }
+      ],
+      "total_samples": 481
+    }
+  },
+  "aggregate": {
+    "buckets": [
+      {
+        "bucket": "0.50-0.55",
+        "avg_return": 0.1245,
+        "median_return": 0.5267,
+        "hit_rate": 54.17,
+        "n": 240
+      },
+      {
+        "bucket": "0.55-0.60",
+        "avg_return": 0.7077,
+        "median_return": 0.8227,
+        "hit_rate": 58.08,
+        "n": 229
+      },
+      {
+        "bucket": "0.60-0.65",
+        "avg_return": 1.0385,
+        "median_return": 0.7139,
+        "hit_rate": 60.91,
+        "n": 243
+      },
+      {
+        "bucket": "0.65-0.70",
+        "avg_return": 0.3627,
+        "median_return": 0.2371,
+        "hit_rate": 54.55,
+        "n": 242
+      },
+      {
+        "bucket": "0.70+",
+        "avg_return": 0.7395,
+        "median_return": 0.6685,
+        "hit_rate": 56.24,
+        "n": 1355
+      }
+    ],
+    "total_samples": 2309
+  }
+}

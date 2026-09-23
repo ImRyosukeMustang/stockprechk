@@ -90,6 +90,13 @@ STOP_LOSS_PCT: float = 0.08
 TAKE_PROFIT_PCT: float = 0.15
 
 # ---------------------------------------------------------------------------
+# Volatility targeting (used by vol_target.py for position sizing)
+# ---------------------------------------------------------------------------
+TARGET_VOL: float = 0.15           # annualized target volatility
+VOL_LOOKBACK_DAYS: int = 20        # rolling window for realized vol
+MIN_REBALANCE_DELTA: float = 0.15  # only rebalance if position changes by >= 15%
+
+# ---------------------------------------------------------------------------
 # Predictor (Phase 3 — the ML brain)
 # ---------------------------------------------------------------------------
 MODELS_DIR: Path = BASE_DIR / "models"

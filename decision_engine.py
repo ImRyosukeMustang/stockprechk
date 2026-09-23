@@ -232,6 +232,106 @@ def generate_watchlist_signals(
     return results
 
 
+def generate_sma_vol_signal(conn: sqlite3.Connection, ticker: str) -> dict:
+    """Generate an SMA(50/200) plus volatility-targeted position signal."""
+    import pandas as pd
+    import vol_target
+
+    rows = database.get_price_history(conn, ticker)
+    if not rows or len(rows) < 200:
+        log.warning(
+            "Not enough price history for SMA+vol signal on %s (%d rows).",
+            ticker,
+            len(rows) if rows else 0,
+        )
+        return {
+            "ticker": ticker,
+            "date": None,
+            "regime": "unknown",
+            "sma50": None,
+            "sma200": None,
+            "realized_vol": None,
+            "target_vol": config.TARGET_VOL,
+            "position_size": 0.0,
+            "reasoning": "Insufficient price history for SMA(200).",
+        }
+
+    df = pd.DataFrame([dict(row) for row in rows])
+    df["date"] = pd.to_datetime(df["date"])
+    df = df.sort_values("date").reset_index(drop=True)
+    df["sma50"] = df["close"].rolling(window=50, min_periods=50).mean()
+    df["sma200"] = df["close"].rolling(window=200, min_periods=200).mean()
+
+    latest = df.iloc[-1]
+    sma50 = float(latest["sma50"]) if pd.notna(latest["sma50"]) else None
+    sma200 = float(latest["sma200"]) if pd.notna(latest["sma200"]) else None
+    returns = df["close"].pct_change().dropna().iloc[-config.VOL_LOOKBACK_DAYS:]
+    realized_vol = float(returns.std() * (252 ** 0.5)) if len(returns) > 0 else None
+
+    if sma50 is None or sma200 is None:
+        regime = "unknown"
+        position_size = 0.0
+    elif sma50 > sma200:
+        regime = "bullish"
+        position_size = vol_target.compute_position_size(
+            df["close"], target_vol=config.TARGET_VOL, lookback=config.VOL_LOOKBACK_DAYS
+        )
+    else:
+        regime = "bearish"
+        position_size = 0.0
+
+    latest_date = latest["date"].strftime("%Y-%m-%d")
+    if regime == "bullish":
+        reasoning = (
+            f"SMA bullish (SMA50={sma50:.2f} > SMA200={sma200:.2f}). "
+            f"Realized vol={realized_vol:.1%}, target vol={config.TARGET_VOL:.1%}. "
+            f"Position size={position_size:.0%}."
+        )
+    elif regime == "bearish":
+        reasoning = (
+            f"SMA bearish (SMA50={sma50:.2f} < SMA200={sma200:.2f}). "
+            "Position size=0% (cash)."
+        )
+    else:
+        reasoning = "SMA values not yet available."
+
+    log.info(
+        "%s SMA+Vol: regime=%s position=%.0f%% — %s",
+        ticker, regime, position_size * 100, reasoning,
+    )
+    return {
+        "ticker": ticker,
+        "date": latest_date,
+        "regime": regime,
+        "sma50": sma50,
+        "sma200": sma200,
+        "realized_vol": realized_vol,
+        "target_vol": config.TARGET_VOL,
+        "position_size": position_size,
+        "reasoning": reasoning,
+    }
+
+
+def generate_sma_vol_watchlist(
+    conn: sqlite3.Connection, tickers: list[str] | None = None
+) -> dict[str, dict]:
+    """Run the SMA plus volatility-targeted signal for every watchlist ticker."""
+    tickers = tickers or config.WATCHLIST
+    results: dict[str, dict] = {}
+    for ticker in tickers:
+        try:
+            results[ticker] = generate_sma_vol_signal(conn, ticker)
+        except Exception as exc:
+            log.error("Unexpected error generating SMA+vol signal for %s: %s", ticker, exc)
+            results[ticker] = {
+                "ticker": ticker,
+                "regime": "error",
+                "position_size": 0.0,
+                "reasoning": str(exc),
+            }
+    return results
+
+
 if __name__ == "__main__":
     database.init_db()
     with database.get_connection() as conn:
