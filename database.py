@@ -168,6 +168,45 @@ CREATE TABLE IF NOT EXISTS backtest_results (
 );
  
 CREATE INDEX IF NOT EXISTS idx_backtest_ticker ON backtest_results(ticker);
+
+CREATE TABLE IF NOT EXISTS prices_intraday (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    ticker      TEXT    NOT NULL,
+    interval    TEXT    NOT NULL,          -- '1m', '5m', '1h', etc.
+    timestamp   TEXT    NOT NULL,          -- ISO datetime (UTC)
+    open        REAL    NOT NULL,
+    high        REAL    NOT NULL,
+    low         REAL    NOT NULL,
+    close       REAL    NOT NULL,
+    volume      INTEGER NOT NULL,
+    vwap        REAL,
+    trade_count INTEGER,
+    fetched_at  TEXT    NOT NULL DEFAULT (datetime('now')),
+    UNIQUE(ticker, interval, timestamp)
+);
+
+CREATE INDEX IF NOT EXISTS idx_prices_intraday_ticker_interval
+    ON prices_intraday(ticker, interval, timestamp);
+
+CREATE TABLE IF NOT EXISTS sma_signal_journal (
+    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+    date                TEXT    NOT NULL,
+    ticker              TEXT    NOT NULL,
+    regime              TEXT    NOT NULL,       -- 'bullish' | 'bearish'
+    sma50               REAL,
+    sma200              REAL,
+    close_at_signal     REAL,
+    action              TEXT    NOT NULL,       -- 'BUY' | 'SELL' | 'HOLD'
+    forward_5d_return   REAL,                   -- % return, filled in 5 days later
+    forward_20d_return  REAL,                   -- % return, filled in 20 days later
+    forward_60d_return  REAL,                   -- % return, filled in 60 days later
+    was_correct_5d      INTEGER,                -- 1 if signal direction matched, 0 if not, NULL if N/A
+    created_at          TEXT    NOT NULL DEFAULT (datetime('now')),
+    UNIQUE(date, ticker)
+);
+
+CREATE INDEX IF NOT EXISTS idx_journal_ticker_date ON sma_signal_journal(ticker, date);
+CREATE INDEX IF NOT EXISTS idx_journal_date ON sma_signal_journal(date);
 """
  
  

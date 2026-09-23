@@ -1,8 +1,8 @@
 """
-scheduler.py — runs main.run_pipeline() on a recurring timer via APScheduler.
+scheduler.py — runs main.run_pipeline_sma_only() on a recurring timer via APScheduler.
 
-This is a thin wrapper, deliberately. All the actual work (fetch, sentiment,
-technical, predict, decide) lives in main.py; scheduler.py's only job is to
+This is a thin wrapper, deliberately. All the actual work (fetch, indicators,
+decide, allocate) lives in main.py; scheduler.py's only job is to
 call it on a schedule and keep the process alive. If APScheduler isn't
 installed, this module says so clearly and exits rather than pretending to
 run — there's no meaningful degraded mode for "the thing whose entire job
@@ -21,7 +21,7 @@ import sys
 
 import config
 import database
-import llm_analyst
+import journal
 import main as pipeline_main
 
 log = config.get_logger(__name__)
@@ -29,36 +29,14 @@ log = config.get_logger(__name__)
 
 def run_full_cycle(tickers: list[str] | None = None) -> None:
     """
-    One complete scheduled cycle: run the Phase 1-3 pipeline (fetch, sentiment,
-    technical, predict, decide — see main.run_pipeline), then generate a
-    written thesis for any ticker whose signal landed in config.THESIS_SIGNALS.
-
-    main.run_pipeline() already runs decision_engine and persists each
-    signal, but its summary dict doesn't carry the signal's row id forward.
-    So after the pipeline finishes, we re-fetch each qualifying ticker's
-    just-written signal row (rather than regenerating a fresh signal, which
-    could theoretically differ if data changed mid-run) and attach a thesis
-    to that exact row. This keeps "decide" and "explain" as separable steps
-    — you can run the decision pipeline without ever spending an LLM call on
-    prose, which matters since gpt-4o calls cost real money.
+    Run one complete SMA-only cycle: fetch daily data, compute indicators,
+    persist deterministic SMA signals, and calculate portfolio allocation.
     """
     tickers = tickers or config.WATCHLIST
-    summary = pipeline_main.run_pipeline(tickers)
-
+    pipeline_main.run_pipeline_sma_only(tickers)
     with database.get_connection() as conn:
-        for ticker, ticker_summary in summary.items():
-            if ticker_summary.get("signal") not in config.THESIS_SIGNALS:
-                continue
-            row = database.get_latest_signal(conn, ticker)
-            if row is None:
-                continue
-            fake_signal = {
-                "signal": row["signal"],
-                "confidence": row["confidence"],
-                "reasoning": row["reasoning"],
-                "signal_id": row["id"],
-            }
-            llm_analyst.generate_and_store_thesis(conn, ticker, fake_signal)
+        journal.backfill_forward_returns(conn)
+        journal.print_journal_summary(conn)
 
 
 def run_once(tickers: list[str] | None = None) -> None:

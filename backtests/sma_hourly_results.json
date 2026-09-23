@@ -1,0 +1,52 @@
+[
+    {
+        "ticker": "AAPL",
+        "total_return_pct": -2.58,
+        "buy_hold_return_pct": 8.6,
+        "n_trades": 2,
+        "win_rate": 50.0,
+        "sharpe_ratio": -2.04,
+        "max_drawdown_pct": -5.61,
+        "exposure_pct": 56.98
+    },
+    {
+        "ticker": "MSFT",
+        "total_return_pct": -2.7,
+        "buy_hold_return_pct": 2.74,
+        "n_trades": 3,
+        "win_rate": 33.33,
+        "sharpe_ratio": -4.04,
+        "max_drawdown_pct": -3.49,
+        "exposure_pct": 19.63
+    },
+    {
+        "ticker": "NVDA",
+        "total_return_pct": 2.82,
+        "buy_hold_return_pct": 6.67,
+        "n_trades": 2,
+        "win_rate": 100.0,
+        "sharpe_ratio": 1.62,
+        "max_drawdown_pct": -7.33,
+        "exposure_pct": 43.53
+    },
+    {
+        "ticker": "GOOGL",
+        "total_return_pct": -6.78,
+        "buy_hold_return_pct": -2.59,
+        "n_trades": 3,
+        "win_rate": 33.33,
+        "sharpe_ratio": -3.77,
+        "max_drawdown_pct": -7.11,
+        "exposure_pct": 39.88
+    },
+    {
+        "ticker": "AMZN",
+        "total_return_pct": -2.35,
+        "buy_hold_return_pct": -4.62,
+        "n_trades": 1,
+        "win_rate": 0.0,
+        "sharpe_ratio": -3.22,
+        "max_drawdown_pct": -4.08,
+        "exposure_pct": 12.42
+    }
+]

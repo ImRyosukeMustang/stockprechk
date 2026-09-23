@@ -22,7 +22,9 @@ import config
 import data_fetcher
 import database
 import decision_engine
+import journal
 import predictor
+import portfolio
 import sentiment
 import technical
 
@@ -112,6 +114,49 @@ def _log_summary(summary: dict[str, dict[str, int]]) -> None:
         log.info("%s: %s", ticker, parts)
 
 
+def run_pipeline_sma_only(tickers: list[str] | None = None) -> dict:
+    """Fetch daily data and run the SMA-only signal and allocation pipeline."""
+    tickers = tickers or config.WATCHLIST
+    database.init_db()
+    signals: dict[str, dict] = {}
+
+    with database.get_connection() as conn:
+        journal.backfill_forward_returns(conn)
+        log.info("Starting SMA-only pipeline for %d tickers", len(tickers))
+        for ticker in tickers:
+            company_name = COMPANY_NAMES.get(ticker.upper())
+            log.info("--- %s ---", ticker)
+            data_fetcher.fetch_all_for_ticker(conn, ticker, company_name)
+            technical.compute_indicators_for_ticker(conn, ticker)
+            signals[ticker] = decision_engine.generate_sma_only_signal(conn, ticker)
+            latest_prices = database.get_price_history(conn, ticker, limit=1)
+            close_price = float(latest_prices[0]["close"]) if latest_prices else None
+            signal = signals[ticker]
+            journal.log_signal(
+                conn,
+                ticker,
+                signal["regime"],
+                signal["sma50"],
+                signal["sma200"],
+                close_price,
+                "BUY" if signal["regime"] == "bullish" else "SELL",
+            )
+
+        allocation = portfolio.compute_portfolio_allocation(signals)
+        portfolio_summary = portfolio.compute_portfolio_summary(allocation)
+
+    log.info("SMA-only pipeline complete")
+    return {
+        "signals": signals,
+        "allocation": allocation,
+        "portfolio_summary": portfolio_summary,
+    }
+
+
 if __name__ == "__main__":
-    requested_tickers = [t.upper() for t in sys.argv[1:]] or None
-    run_pipeline(requested_tickers)
+    sma_only = "--sma-only" in sys.argv[1:]
+    requested_tickers = [t.upper() for t in sys.argv[1:] if t != "--sma-only"] or None
+    if sma_only:
+        run_pipeline_sma_only(requested_tickers)
+    else:
+        run_pipeline(requested_tickers)

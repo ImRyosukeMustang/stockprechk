@@ -84,7 +84,10 @@ WATCHLIST: list[str] = [
 # Risk / decision-engine settings (Phase 3 will consume these; defined now
 # so config.py is the single source of truth from day one)
 # ---------------------------------------------------------------------------
-MAX_POSITION_PCT: float = 0.05      # max % of a hypothetical portfolio per position
+# Portfolio / SMA-only mode
+MAX_POSITION_PCT: float = 0.20
+MAX_TOTAL_EXPOSURE: float = 1.00
+PORTFOLIO_MODE: str = "sma_only"  # or "ml"
 MIN_CONFIDENCE_TO_ACT: float = 0.60  # signals below this confidence become HOLD
 STOP_LOSS_PCT: float = 0.08
 TAKE_PROFIT_PCT: float = 0.15

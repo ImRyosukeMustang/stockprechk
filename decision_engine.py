@@ -332,6 +332,106 @@ def generate_sma_vol_watchlist(
     return results
 
 
+def generate_sma_only_signal(conn: sqlite3.Connection, ticker: str) -> dict:
+    """Generate and persist a deterministic SMA(50/200) regime signal."""
+    import pandas as pd
+
+    rows = database.get_price_history(conn, ticker)
+    if not rows:
+        log.warning("No price history for SMA-only signal on %s.", ticker)
+        result = {
+            "ticker": ticker,
+            "date": None,
+            "regime": "unknown",
+            "sma50": None,
+            "sma200": None,
+            "position_size": 0.0,
+            "reasoning": "No daily price history available for SMA(50/200).",
+            "signal_id": None,
+        }
+        return result
+
+    df = pd.DataFrame([dict(row) for row in rows])
+    df["date"] = pd.to_datetime(df["date"])
+    df = df.sort_values("date").reset_index(drop=True)
+    df["sma50"] = df["close"].rolling(window=50, min_periods=50).mean()
+    df["sma200"] = df["close"].rolling(window=200, min_periods=200).mean()
+
+    latest = df.iloc[-1]
+    latest_date = latest["date"].strftime("%Y-%m-%d")
+    sma50 = float(latest["sma50"]) if pd.notna(latest["sma50"]) else None
+    sma200 = float(latest["sma200"]) if pd.notna(latest["sma200"]) else None
+
+    if sma50 is None or sma200 is None:
+        regime = "unknown"
+        position_size = 0.0
+        signal = "HOLD"
+        reasoning = "Insufficient price history for SMA(50/200)."
+        confidence = 0.0
+    elif sma50 > sma200:
+        regime = "bullish"
+        position_size = 1.0
+        signal = "BUY"
+        confidence = 1.0
+        reasoning = f"SMA bullish (SMA50={sma50:.2f} > SMA200={sma200:.2f})."
+    else:
+        regime = "bearish"
+        position_size = 0.0
+        signal = "SELL"
+        confidence = 1.0
+        reasoning = f"SMA bearish (SMA50={sma50:.2f} <= SMA200={sma200:.2f})."
+
+    result = {
+        "ticker": ticker,
+        "date": latest_date,
+        "regime": regime,
+        "sma50": sma50,
+        "sma200": sma200,
+        "position_size": position_size,
+        "reasoning": reasoning,
+        "signal_id": database.insert_signal(
+            conn,
+            ticker,
+            latest_date,
+            signal,
+            confidence,
+            reasoning,
+            dry_run=config.DRY_RUN,
+        ),
+    }
+    log.info(
+        "%s SMA regime: %s (SMA50=%s, SMA200=%s)",
+        ticker,
+        regime,
+        f"{sma50:.2f}" if sma50 is not None else "N/A",
+        f"{sma200:.2f}" if sma200 is not None else "N/A",
+    )
+    return result
+
+
+def generate_sma_only_watchlist(
+    conn: sqlite3.Connection, tickers: list[str] | None = None
+) -> dict[str, dict]:
+    """Generate SMA-only signals for every ticker, isolating ticker failures."""
+    results: dict[str, dict] = {}
+    for ticker in tickers or config.WATCHLIST:
+        try:
+            results[ticker] = generate_sma_only_signal(conn, ticker)
+        except Exception as exc:
+            log.error("Unexpected error generating SMA-only signal for %s: %s", ticker, exc)
+            results[ticker] = {
+                "ticker": ticker,
+                "date": None,
+                "regime": "unknown",
+                "sma50": None,
+                "sma200": None,
+                "position_size": 0.0,
+                "reasoning": f"error: {exc}",
+                "signal_id": None,
+            }
+    return results
+
+
 if __name__ == "__main__":
     database.init_db()
     with database.get_connection() as conn:

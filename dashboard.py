@@ -20,6 +20,7 @@ import sys
 
 import config
 import database
+import portfolio
 
 log = config.get_logger(__name__)
 
@@ -178,6 +179,83 @@ def _backtest_panel(conn, ticker: str) -> None:
     )
 
 
+def _latest_sma_data(conn, tickers: list[str]) -> dict[str, dict]:
+    """Load the latest daily SMA values for each ticker without writing data."""
+    latest: dict[str, dict] = {}
+    for ticker in tickers:
+        row = conn.execute(
+            """
+            SELECT p.date, t.sma_50, t.sma_200
+            FROM prices p
+            LEFT JOIN technical_indicators t
+                ON t.ticker = p.ticker AND t.date = p.date
+            WHERE p.ticker = ?
+            ORDER BY p.date DESC
+            LIMIT 1
+            """,
+            (ticker,),
+        ).fetchone()
+        if row is None:
+            latest[ticker] = {
+                "date": None,
+                "regime": "unknown",
+                "sma50": None,
+                "sma200": None,
+                "position_size": 0.0,
+            }
+            continue
+
+        sma50 = row["sma_50"]
+        sma200 = row["sma_200"]
+        regime = "unknown" if sma50 is None or sma200 is None else "bullish" if sma50 > sma200 else "bearish"
+        latest[ticker] = {
+            "date": row["date"],
+            "regime": regime,
+            "sma50": sma50,
+            "sma200": sma200,
+            "position_size": 1.0 if regime == "bullish" else 0.0,
+        }
+    return latest
+
+
+def _sma_regime_panel(conn, tickers: list[str]) -> dict[str, dict]:
+    """Show the current SMA regime across the watchlist."""
+    data = _latest_sma_data(conn, tickers)
+    st.subheader("SMA Regime")
+    st.dataframe(
+        [
+            {
+                "Ticker": ticker,
+                "Regime": values["regime"],
+                "SMA50": f"{values['sma50']:.2f}" if values["sma50"] is not None else "N/A",
+                "SMA200": f"{values['sma200']:.2f}" if values["sma200"] is not None else "N/A",
+                "As of": values["date"] or "N/A",
+            }
+            for ticker, values in data.items()
+        ],
+        use_container_width=True,
+    )
+    return data
+
+
+def _portfolio_allocation_panel(sma_data: dict[str, dict]) -> None:
+    """Show equal-weight SMA-only allocation and cash remainder."""
+    allocation = portfolio.compute_portfolio_allocation(sma_data)
+    summary = portfolio.compute_portfolio_summary(allocation)
+    st.subheader("Portfolio Allocation")
+    st.dataframe(
+        [
+            {"Ticker": ticker, "Weight": f"{weight:.1%}"}
+            for ticker, weight in allocation.items()
+        ],
+        use_container_width=True,
+    )
+    col1, col2, col3 = st.columns(3)
+    col1.metric("Total exposure", f"{summary['total_exposure']:.1%}")
+    col2.metric("Cash", f"{summary['cash_pct']:.1%}")
+    col3.metric("Positions", summary["n_positions"])
+
+
 def main() -> None:
     st.title("📈 StockOracle")
     st.caption("Research tool — analysis and reasoning, not financial advice.")
@@ -192,6 +270,9 @@ def main() -> None:
 
         st.sidebar.header("Watchlist")
         ticker = st.sidebar.selectbox("Ticker", watchlist_tickers or config.WATCHLIST)
+
+        sma_data = _sma_regime_panel(conn, config.WATCHLIST)
+        _portfolio_allocation_panel(sma_data)
 
         if st.sidebar.button("Run pipeline now", help="Fetch fresh data and regenerate signals for this ticker."):
             with st.spinner(f"Running pipeline for {ticker}..."):
