@@ -1,6 +1,6 @@
 """
 database.py — SQLite schema and access helpers for StockOracle.
-
+ 
 Design notes:
 - Raw sqlite3 (no ORM), per the project's tech stack.
 - One connection helper (`get_connection`) that every other function reuses;
@@ -14,18 +14,18 @@ Design notes:
   where duplicates are meaningless (e.g. the same price bar fetched twice),
   so re-running data_fetcher.py is always safe.
 """
-
+ 
 from __future__ import annotations
-
+ 
 import sqlite3
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Iterator, Sequence
-
+ 
 import config
-
+ 
 log = config.get_logger(__name__)
-
+ 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS prices (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -39,9 +39,9 @@ CREATE TABLE IF NOT EXISTS prices (
     fetched_at  TEXT    NOT NULL DEFAULT (datetime('now')),
     UNIQUE(ticker, date)
 );
-
+ 
 CREATE INDEX IF NOT EXISTS idx_prices_ticker_date ON prices(ticker, date);
-
+ 
 CREATE TABLE IF NOT EXISTS news (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
     ticker      TEXT    NOT NULL,
@@ -53,9 +53,9 @@ CREATE TABLE IF NOT EXISTS news (
     fetched_at  TEXT    NOT NULL DEFAULT (datetime('now')),
     UNIQUE(ticker, url)
 );
-
+ 
 CREATE INDEX IF NOT EXISTS idx_news_ticker ON news(ticker);
-
+ 
 CREATE TABLE IF NOT EXISTS reddit_posts (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
     ticker      TEXT    NOT NULL,
@@ -69,9 +69,9 @@ CREATE TABLE IF NOT EXISTS reddit_posts (
     fetched_at  TEXT    NOT NULL DEFAULT (datetime('now')),
     UNIQUE(post_id)
 );
-
+ 
 CREATE INDEX IF NOT EXISTS idx_reddit_ticker ON reddit_posts(ticker);
-
+ 
 CREATE TABLE IF NOT EXISTS fundamentals (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
     ticker      TEXT    NOT NULL,
@@ -86,7 +86,7 @@ CREATE TABLE IF NOT EXISTS fundamentals (
     fetched_at  TEXT    NOT NULL DEFAULT (datetime('now')),
     UNIQUE(ticker, date)
 );
-
+ 
 CREATE TABLE IF NOT EXISTS sentiment_scores (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
     ticker      TEXT    NOT NULL,
@@ -97,9 +97,9 @@ CREATE TABLE IF NOT EXISTS sentiment_scores (
     detail_json TEXT,                      -- model-specific extra info
     created_at  TEXT    NOT NULL DEFAULT (datetime('now'))
 );
-
+ 
 CREATE INDEX IF NOT EXISTS idx_sentiment_ticker_date ON sentiment_scores(ticker, date);
-
+ 
 CREATE TABLE IF NOT EXISTS technical_indicators (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
     ticker      TEXT    NOT NULL,
@@ -114,17 +114,18 @@ CREATE TABLE IF NOT EXISTS technical_indicators (
     created_at  TEXT    NOT NULL DEFAULT (datetime('now')),
     UNIQUE(ticker, date)
 );
-
+ 
 CREATE TABLE IF NOT EXISTS predictions (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
     ticker      TEXT    NOT NULL,
     date        TEXT    NOT NULL,
     model_name  TEXT    NOT NULL,          -- e.g. 'xgboost_v1'
     probability_up REAL NOT NULL,          -- model's raw probability output
+    fold_id     INTEGER,                   -- walk-forward fold index (NULL for live predictions)
     created_at  TEXT    NOT NULL DEFAULT (datetime('now')),
     UNIQUE(ticker, date, model_name)
 );
-
+ 
 CREATE TABLE IF NOT EXISTS signals (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
     ticker      TEXT    NOT NULL,
@@ -136,9 +137,9 @@ CREATE TABLE IF NOT EXISTS signals (
     dry_run     INTEGER NOT NULL DEFAULT 1,
     created_at  TEXT    NOT NULL DEFAULT (datetime('now'))
 );
-
+ 
 CREATE INDEX IF NOT EXISTS idx_signals_ticker_date ON signals(ticker, date);
-
+ 
 CREATE TABLE IF NOT EXISTS pipeline_runs (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
     started_at  TEXT    NOT NULL DEFAULT (datetime('now')),
@@ -146,7 +147,7 @@ CREATE TABLE IF NOT EXISTS pipeline_runs (
     status      TEXT    NOT NULL DEFAULT 'running',  -- 'running' | 'success' | 'failed'
     detail      TEXT
 );
-
+ 
 CREATE TABLE IF NOT EXISTS backtest_results (
     id                  INTEGER PRIMARY KEY AUTOINCREMENT,
     ticker              TEXT    NOT NULL,
@@ -165,17 +166,17 @@ CREATE TABLE IF NOT EXISTS backtest_results (
     detail_json         TEXT,                 -- full equity curve + per-trade log
     created_at          TEXT    NOT NULL DEFAULT (datetime('now'))
 );
-
+ 
 CREATE INDEX IF NOT EXISTS idx_backtest_ticker ON backtest_results(ticker);
 """
-
-
+ 
+ 
 @contextmanager
 def get_connection(db_path: Path | str | None = None) -> Iterator[sqlite3.Connection]:
     """
     Yield a sqlite3 connection with sane defaults (row factory, foreign keys),
     committing on clean exit and rolling back on exception. Always closes.
-
+ 
     Usage:
         with get_connection() as conn:
             conn.execute(...)
@@ -192,19 +193,30 @@ def get_connection(db_path: Path | str | None = None) -> Iterator[sqlite3.Connec
         raise
     finally:
         conn.close()
-
-
+ 
+ 
 def init_db(db_path: Path | str | None = None) -> None:
     """Create all tables/indexes if they don't already exist. Safe to call repeatedly."""
     with get_connection(db_path) as conn:
         conn.executescript(SCHEMA)
+        # Migration for DBs created before `fold_id` was added to `predictions`.
+        # SCHEMA above already includes fold_id for brand-new databases (CREATE
+        # TABLE IF NOT EXISTS is a no-op there), so this ALTER TABLE only ever
+        # does real work against a pre-existing predictions table that lacks
+        # the column. Idempotent: swallow "duplicate column name" and re-raise
+        # anything else.
+        try:
+            conn.execute("ALTER TABLE predictions ADD COLUMN fold_id INTEGER")
+        except sqlite3.OperationalError as exc:
+            if "duplicate column name" not in str(exc).lower():
+                raise  # Re-raise real errors; ignore "already exists"
     log.info("Database initialized at %s", db_path or config.DB_PATH)
-
-
+ 
+ 
 # ---------------------------------------------------------------------------
 # Insert helpers
 # ---------------------------------------------------------------------------
-
+ 
 def insert_price_bar(
     conn: sqlite3.Connection,
     ticker: str,
@@ -222,8 +234,8 @@ def insert_price_bar(
         """,
         (ticker, date, open_, high, low, close, volume),
     )
-
-
+ 
+ 
 def insert_price_bars(conn: sqlite3.Connection, ticker: str, rows: Sequence[dict[str, Any]]) -> int:
     """Bulk-insert price bars. Each row dict needs date/open/high/low/close/volume. Returns row count inserted."""
     conn.executemany(
@@ -234,8 +246,8 @@ def insert_price_bars(conn: sqlite3.Connection, ticker: str, rows: Sequence[dict
         [{**row, "ticker": ticker} for row in rows],
     )
     return len(rows)
-
-
+ 
+ 
 def insert_news_item(
     conn: sqlite3.Connection,
     ticker: str,
@@ -252,8 +264,8 @@ def insert_news_item(
         """,
         (ticker, source, title, url, published_at, summary),
     )
-
-
+ 
+ 
 def insert_reddit_post(
     conn: sqlite3.Connection,
     ticker: str,
@@ -273,8 +285,8 @@ def insert_reddit_post(
         """,
         (ticker, subreddit, post_id, title, score, num_comments, created_utc, url),
     )
-
-
+ 
+ 
 def insert_fundamentals(
     conn: sqlite3.Connection,
     ticker: str,
@@ -295,8 +307,8 @@ def insert_fundamentals(
         """,
         (ticker, date, market_cap, pe_ratio, eps, dividend_yield, sector, industry, raw_json),
     )
-
-
+ 
+ 
 def replace_sentiment_score(
     conn: sqlite3.Connection,
     ticker: str,
@@ -322,8 +334,8 @@ def replace_sentiment_score(
         """,
         (ticker, date, source_type, score, label, detail_json),
     )
-
-
+ 
+ 
 def upsert_technical_indicators(
     conn: sqlite3.Connection,
     ticker: str,
@@ -356,14 +368,14 @@ def upsert_technical_indicators(
         """,
         (ticker, date, rsi_14, macd, macd_signal, bb_upper, bb_lower, sma_50, sma_200),
     )
-
-
+ 
+ 
 def get_technical_indicators(conn: sqlite3.Connection, ticker: str, date: str) -> sqlite3.Row | None:
     return conn.execute(
         "SELECT * FROM technical_indicators WHERE ticker = ? AND date = ?", (ticker, date)
     ).fetchone()
-
-
+ 
+ 
 def get_latest_sentiment(conn: sqlite3.Connection, ticker: str, source_type: str | None = None) -> list[sqlite3.Row]:
     """Return the most recent sentiment_scores row(s) for a ticker, optionally
     filtered to one source_type ('news' | 'reddit' | 'llm')."""
@@ -383,8 +395,8 @@ def get_latest_sentiment(conn: sqlite3.Connection, ticker: str, source_type: str
         """,
         (ticker, ticker),
     ).fetchall()
-
-
+ 
+ 
 def get_price_and_indicators(conn: sqlite3.Connection, ticker: str) -> list[sqlite3.Row]:
     """Return one row per date with price OHLCV joined to that date's technical
     indicators (LEFT JOIN — early dates before enough history exist will have
@@ -401,8 +413,8 @@ def get_price_and_indicators(conn: sqlite3.Connection, ticker: str) -> list[sqli
         """,
         (ticker,),
     ).fetchall()
-
-
+ 
+ 
 def get_all_sentiment(conn: sqlite3.Connection, ticker: str) -> list[sqlite3.Row]:
     """Return every stored sentiment_scores row for a ticker (all dates, all
     source types), ascending by date. predictor.py pivots this into
@@ -412,25 +424,35 @@ def get_all_sentiment(conn: sqlite3.Connection, ticker: str) -> list[sqlite3.Row
     return conn.execute(
         "SELECT * FROM sentiment_scores WHERE ticker = ? ORDER BY date ASC", (ticker,)
     ).fetchall()
-
-
-def insert_prediction(conn: sqlite3.Connection, ticker: str, date: str, model_name: str, probability_up: float) -> None:
+ 
+ 
+def insert_prediction(
+    conn: sqlite3.Connection,
+    ticker: str,
+    date: str,
+    model_name: str,
+    probability_up: float,
+    fold_id: int | None = None,
+) -> None:
     """Idempotent write for a model's prediction on (ticker, date, model_name).
     Relies on the table's UNIQUE(ticker, date, model_name) constraint, so
     re-running the predictor for a date it already scored updates that row
-    in place rather than raising an IntegrityError or piling up duplicates."""
+    in place rather than raising an IntegrityError or piling up duplicates.
+    `fold_id` is the walk-forward fold index that produced this prediction
+    (None for live-pipeline predictions, which aren't tied to a fold)."""
     conn.execute(
         """
-        INSERT INTO predictions (ticker, date, model_name, probability_up)
-        VALUES (?, ?, ?, ?)
+        INSERT INTO predictions (ticker, date, model_name, probability_up, fold_id)
+        VALUES (?, ?, ?, ?, ?)
         ON CONFLICT(ticker, date, model_name) DO UPDATE SET
             probability_up = excluded.probability_up,
+            fold_id = excluded.fold_id,
             created_at = datetime('now')
         """,
-        (ticker, date, model_name, probability_up),
+        (ticker, date, model_name, probability_up, fold_id),
     )
-
-
+ 
+ 
 def get_latest_prediction(conn: sqlite3.Connection, ticker: str, model_name: str) -> sqlite3.Row | None:
     return conn.execute(
         """
@@ -439,8 +461,8 @@ def get_latest_prediction(conn: sqlite3.Connection, ticker: str, model_name: str
         """,
         (ticker, model_name),
     ).fetchone()
-
-
+ 
+ 
 def insert_signal(
     conn: sqlite3.Connection,
     ticker: str,
@@ -464,15 +486,15 @@ def insert_signal(
         (ticker, date, signal, confidence, reasoning, thesis, int(dry_run)),
     )
     return int(cur.lastrowid)
-
-
+ 
+ 
 def get_latest_signal(conn: sqlite3.Connection, ticker: str) -> sqlite3.Row | None:
     return conn.execute(
         "SELECT * FROM signals WHERE ticker = ? ORDER BY date DESC, created_at DESC LIMIT 1",
         (ticker,),
     ).fetchone()
-
-
+ 
+ 
 def update_signal_thesis(conn: sqlite3.Connection, signal_id: int, thesis: str) -> None:
     """Attach an LLM-written thesis to an already-persisted signal row.
     llm_analyst.py calls this after decision_engine.py has already written
@@ -480,8 +502,8 @@ def update_signal_thesis(conn: sqlite3.Connection, signal_id: int, thesis: str) 
     original signal decision, so it's a separate write rather than requiring
     every signal-writer to know about theses."""
     conn.execute("UPDATE signals SET thesis = ? WHERE id = ?", (thesis, signal_id))
-
-
+ 
+ 
 def insert_backtest_result(conn: sqlite3.Connection, result: dict[str, Any]) -> int:
     """Insert one backtest summary row. `result` keys must match the
     backtest_results columns (ticker, model_name, start_date, end_date,
@@ -506,39 +528,39 @@ def insert_backtest_result(conn: sqlite3.Connection, result: dict[str, Any]) -> 
         result,
     )
     return int(cur.lastrowid)
-
-
+ 
+ 
 def get_backtest_results(conn: sqlite3.Connection, ticker: str) -> list[sqlite3.Row]:
     return conn.execute(
         "SELECT * FROM backtest_results WHERE ticker = ? ORDER BY created_at DESC", (ticker,)
     ).fetchall()
-
-
+ 
+ 
 def start_pipeline_run(conn: sqlite3.Connection) -> int:
     """Record the start of a pipeline run and return its id."""
     cur = conn.execute("INSERT INTO pipeline_runs (status) VALUES ('running')")
     return int(cur.lastrowid)
-
-
+ 
+ 
 def finish_pipeline_run(conn: sqlite3.Connection, run_id: int, status: str, detail: str | None = None) -> None:
     conn.execute(
         "UPDATE pipeline_runs SET finished_at = datetime('now'), status = ?, detail = ? WHERE id = ?",
         (status, detail, run_id),
     )
-
-
+ 
+ 
 # ---------------------------------------------------------------------------
 # Query helpers
 # ---------------------------------------------------------------------------
-
+ 
 def get_latest_price_date(conn: sqlite3.Connection, ticker: str) -> str | None:
     """Return the most recent date we have a price bar for, or None if we have nothing yet."""
     row = conn.execute(
         "SELECT MAX(date) AS max_date FROM prices WHERE ticker = ?", (ticker,)
     ).fetchone()
     return row["max_date"] if row else None
-
-
+ 
+ 
 def get_price_history(conn: sqlite3.Connection, ticker: str, limit: int | None = None) -> list[sqlite3.Row]:
     """Return price bars for a ticker in ascending date order. If `limit` is given,
     return only the most recent `limit` bars (still ascending)."""
@@ -551,23 +573,24 @@ def get_price_history(conn: sqlite3.Connection, ticker: str, limit: int | None =
     return conn.execute(
         "SELECT * FROM prices WHERE ticker = ? ORDER BY date ASC", (ticker,)
     ).fetchall()
-
-
+ 
+ 
 def get_recent_news(conn: sqlite3.Connection, ticker: str, limit: int = 20) -> list[sqlite3.Row]:
     return conn.execute(
         "SELECT * FROM news WHERE ticker = ? ORDER BY COALESCE(published_at, fetched_at) DESC LIMIT ?",
         (ticker, limit),
     ).fetchall()
-
-
+ 
+ 
 def get_recent_reddit_posts(conn: sqlite3.Connection, ticker: str, limit: int = 20) -> list[sqlite3.Row]:
     return conn.execute(
         "SELECT * FROM reddit_posts WHERE ticker = ? ORDER BY COALESCE(created_utc, fetched_at) DESC LIMIT ?",
         (ticker, limit),
     ).fetchall()
-
-
+ 
+ 
 if __name__ == "__main__":
     # Running `python database.py` directly just (re)initializes the schema.
     init_db()
     print(f"Database ready at {config.DB_PATH}")
+ 
