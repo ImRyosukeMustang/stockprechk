@@ -105,9 +105,18 @@ def _price_chart(conn, ticker: str):
 
 
 def _signal_panel(conn, ticker: str) -> None:
-    row = database.get_latest_signal(conn, ticker)
+    row = conn.execute(
+        """
+        SELECT *
+        FROM signals
+        WHERE ticker = ? AND reasoning LIKE 'SMA %'
+        ORDER BY date DESC, created_at DESC, id DESC
+        LIMIT 1
+        """,
+        (ticker,),
+    ).fetchone()
     if row is None:
-        st.info("No signal generated yet for this ticker. Run the pipeline first.")
+        st.info("No SMA signal generated yet for this ticker. Run the SMA-only pipeline first.")
         return
 
     signal_color = {"BUY": "green", "SELL": "red", "HOLD": "gray"}.get(row["signal"], "gray")
@@ -117,6 +126,7 @@ def _signal_panel(conn, ticker: str) -> None:
         st.metric("Confidence", f"{row['confidence']:.0%}")
         st.caption(f"As of {row['date']}" + (" (DRY_RUN)" if row["dry_run"] else " (LIVE)"))
     with col2:
+        st.markdown("**Strategy: SMA 50/200**")
         st.markdown("**Reasoning**")
         st.write(row["reasoning"] or "—")
         if row["thesis"]:
@@ -281,8 +291,8 @@ def main() -> None:
             st.sidebar.success("Pipeline run complete — refresh below to see updates.")
 
         st.sidebar.divider()
-        st.sidebar.caption(f"Model: {config.MODEL_NAME if hasattr(config, 'MODEL_NAME') else 'predictor'}")
-        st.sidebar.caption(f"Min confidence to act: {config.MIN_CONFIDENCE_TO_ACT:.0%}")
+        st.sidebar.caption("Strategy: SMA 50/200")
+        st.sidebar.caption("Portfolio: Equal weight, 20% cap")
 
         st.header(f"{ticker}")
         _signal_panel(conn, ticker)
