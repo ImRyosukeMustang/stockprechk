@@ -22,6 +22,23 @@ def _sector_for_ticker(conn, ticker: str) -> str:
     return str(row[0]).strip() if row else "Unknown"
 
 
+def _average_dollar_volume(conn, ticker: str) -> float:
+    row = conn.execute(
+        """
+        SELECT AVG(close * volume) AS avg_dollar_volume
+        FROM (
+            SELECT close, volume
+            FROM prices
+            WHERE ticker = ?
+            ORDER BY date DESC
+            LIMIT ?
+        )
+        """,
+        (ticker, config.LIQUIDITY_LOOKBACK_DAYS),
+    ).fetchone()
+    return float(row[0]) if row and row[0] is not None else 0.0
+
+
 def compute_portfolio_allocation(conn, signals: dict) -> dict:
     """Return equal-weight allocations for the strongest sector-limited signals."""
     bullish = {
@@ -38,6 +55,19 @@ def compute_portfolio_allocation(conn, signals: dict) -> dict:
         key=lambda ticker: bullish[ticker]["strength"],
         reverse=True,
     )
+    liquid_tickers = []
+    for ticker in sorted_tickers:
+        average_dollar_volume = _average_dollar_volume(conn, ticker)
+        if average_dollar_volume < config.MIN_AVG_DOLLAR_VOLUME:
+            log.info(
+                "Skipped %s: avg dollar volume $%.1fM < $%.1fM threshold",
+                ticker,
+                average_dollar_volume / 1_000_000,
+                config.MIN_AVG_DOLLAR_VOLUME / 1_000_000,
+            )
+            continue
+        liquid_tickers.append(ticker)
+    sorted_tickers = liquid_tickers
     sectors = {ticker: _sector_for_ticker(conn, ticker) for ticker in sorted_tickers}
     selected = []
     sector_counts: dict[str, int] = {}

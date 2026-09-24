@@ -41,6 +41,16 @@ CREATE TABLE IF NOT EXISTS prices (
 );
  
 CREATE INDEX IF NOT EXISTS idx_prices_ticker_date ON prices(ticker, date);
+
+CREATE TABLE IF NOT EXISTS data_health (
+    ticker TEXT PRIMARY KEY,
+    last_price_fetch TEXT,
+    last_fundamentals_fetch TEXT,
+    last_news_fetch TEXT,
+    consecutive_failures INTEGER DEFAULT 0,
+    last_error TEXT,
+    updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
  
 CREATE TABLE IF NOT EXISTS news (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,

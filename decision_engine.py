@@ -43,6 +43,7 @@ from datetime import datetime, timezone
 
 import config
 import database
+import data_fetcher
 import predictor
 
 log = config.get_logger(__name__)
@@ -335,6 +336,24 @@ def generate_sma_vol_watchlist(
 def generate_sma_only_signal(conn: sqlite3.Connection, ticker: str) -> dict:
     """Generate and persist a deterministic SMA(50/200) regime signal."""
     import pandas as pd
+
+    if data_fetcher.is_ticker_stale(conn, ticker):
+        reasoning = "Price data is stale (last successful fetch is older than 3 days or unavailable)."
+        log.warning("%s SMA signal skipped: %s", ticker, reasoning)
+        return {
+            "ticker": ticker,
+            "date": datetime.now(timezone.utc).strftime("%Y-%m-%d"),
+            "regime": "stale",
+            "sma50": None,
+            "sma200": None,
+            "strength": 0.0,
+            "position_size": 0.0,
+            "reasoning": reasoning,
+            "signal_id": database.insert_signal(
+                conn, ticker, datetime.now(timezone.utc).strftime("%Y-%m-%d"),
+                "HOLD", 0.0, reasoning, dry_run=config.DRY_RUN,
+            ),
+        }
 
     rows = database.get_price_history(conn, ticker)
     if not rows:

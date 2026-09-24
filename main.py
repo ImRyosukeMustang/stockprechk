@@ -19,7 +19,7 @@ from __future__ import annotations
 import sys
 import time
 from collections.abc import Iterator
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 
 import config
 import data_fetcher
@@ -152,26 +152,30 @@ def _log_summary(summary: dict[str, dict[str, int]]) -> None:
         log.info("%s: %s", ticker, parts)
 
 
-def run_pipeline_sma_only(tickers: list[str] | None = None) -> dict:
-    """Fetch daily data and run the SMA-only signal and allocation pipeline."""
+def run_pipeline_sma_only(
+    tickers: list[str] | None = None,
+    refresh_fundamentals: bool = False,
+) -> dict:
+    """Fetch staged daily data and run the SMA-only signal/allocation pipeline."""
     tickers = tickers or config.WATCHLIST
     database.init_db()
     signals: dict[str, dict] = {}
     successful_count = 0
-    finnhub_tickers = set(tickers[: config.FINNHUB_MAX_TICKERS_PER_RUN])
+    refresh_weekly = datetime.now().weekday() == 6 or refresh_fundamentals
 
     with database.get_connection() as conn:
         journal.backfill_forward_returns(conn)
-        log.info("Starting SMA-only pipeline for %d tickers", len(tickers))
+        log.info(
+            "Starting SMA-only pipeline for %d tickers (weekly extras=%s, manual refresh=%s)",
+            len(tickers), refresh_weekly, refresh_fundamentals,
+        )
         for chunk_number, chunk in enumerate(_chunks(tickers, 40), start=1):
             try:
                 for index, ticker in enumerate(chunk, start=(chunk_number - 1) * 40 + 1):
                     try:
                         company_name = COMPANY_NAMES.get(ticker.upper())
                         log.info("--- %s (%d/%d) ---", ticker, index, len(tickers))
-                        data_fetcher.fetch_all_for_ticker(conn, ticker, company_name)
-                        if config.FINNHUB_ENABLED and ticker in finnhub_tickers:
-                            data_fetcher.fetch_all_finnhub_for_ticker(conn, ticker)
+                        data_fetcher.fetch_prices_only(conn, ticker)
                         technical.compute_indicators_for_ticker(conn, ticker)
                         signals[ticker] = decision_engine.generate_sma_only_signal(conn, ticker)
                         pattern_detector.detect_and_store(conn, ticker)
@@ -206,6 +210,29 @@ def run_pipeline_sma_only(tickers: list[str] | None = None) -> dict:
             if processed < len(tickers):
                 time.sleep(5)
 
+        news_tickers = [
+            ticker for ticker in sorted(
+                signals,
+                key=lambda name: signals[name].get("strength", 0.0),
+                reverse=True,
+            )
+            if signals[ticker].get("regime") == "bullish"
+        ][: config.NEWS_MAX_TICKERS_PER_RUN]
+        log.info("Fetching daily news for %d top-trend ticker(s)", len(news_tickers))
+        for ticker in news_tickers:
+            company_name = COMPANY_NAMES.get(ticker.upper())
+            data_fetcher.fetch_news_for_ticker(conn, ticker, company_name)
+            if config.FINNHUB_ENABLED:
+                data_fetcher.fetch_finnhub_news_for_ticker(conn, ticker)
+
+        if refresh_weekly:
+            log.info("Refreshing weekly fundamentals and company profiles")
+            for ticker in tickers:
+                company_name = COMPANY_NAMES.get(ticker.upper())
+                data_fetcher.fetch_fundamentals(conn, ticker)
+                if config.FINNHUB_ENABLED:
+                    data_fetcher.fetch_finnhub_weekly_extras(conn, ticker)
+
         log.info("Pipeline complete: %d/%d tickers succeeded", successful_count, len(tickers))
         if config.FINNHUB_ENABLED:
             data_fetcher.fetch_finnhub_earnings_calendar(conn)
@@ -222,9 +249,13 @@ def run_pipeline_sma_only(tickers: list[str] | None = None) -> dict:
 
 
 if __name__ == "__main__":
-    sma_only = "--sma-only" in sys.argv[1:]
-    requested_tickers = [t.upper() for t in sys.argv[1:] if t != "--sma-only"] or None
+    refresh_fundamentals = "--refresh-fundamentals" in sys.argv[1:]
+    sma_only = "--sma-only" in sys.argv[1:] or refresh_fundamentals
+    requested_tickers = [
+        t.upper() for t in sys.argv[1:]
+        if t not in {"--sma-only", "--refresh-fundamentals"}
+    ] or None
     if sma_only:
-        run_pipeline_sma_only(requested_tickers)
+        run_pipeline_sma_only(requested_tickers, refresh_fundamentals=refresh_fundamentals)
     else:
         run_pipeline(requested_tickers)

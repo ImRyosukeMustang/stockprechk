@@ -328,6 +328,57 @@ def _paper_portfolio_panel() -> None:
         st.caption("No open paper positions.")
 
 
+def _data_health_panel(conn) -> None:
+    """Show price freshness and repeated fetch failures across the universe."""
+    st.subheader("Data Health")
+    tracked = {
+        *config.WATCHLIST,
+        *(row[0] for row in conn.execute("SELECT ticker FROM data_health").fetchall()),
+    }
+    total = len(tracked)
+    fresh = conn.execute(
+        """
+        SELECT COUNT(*) FROM data_health
+        WHERE last_price_fetch >= datetime('now', '-1 day')
+        """
+    ).fetchone()[0]
+    fresh_three_days = conn.execute(
+        """
+        SELECT COUNT(*) FROM data_health
+        WHERE last_price_fetch >= datetime('now', '-3 days')
+        """
+    ).fetchone()[0]
+    stale = total - fresh_three_days
+    columns = st.columns(3)
+    columns[0].metric("Tracked tickers", total)
+    columns[1].metric("Fresh < 24h", fresh)
+    columns[2].metric("Stale > 3d", stale)
+    failures = conn.execute(
+        """
+        SELECT ticker, consecutive_failures, last_error, updated_at
+        FROM data_health
+        WHERE consecutive_failures > 0
+        ORDER BY consecutive_failures DESC, updated_at DESC
+        LIMIT 10
+        """
+    ).fetchall()
+    if failures:
+        st.dataframe(
+            [
+                {
+                    "Ticker": row["ticker"],
+                    "Consecutive failures": row["consecutive_failures"],
+                    "Last error": row["last_error"] or "",
+                    "Updated": row["updated_at"],
+                }
+                for row in failures
+            ],
+            use_container_width=True,
+        )
+    else:
+        st.caption("No recent fetch failures.")
+
+
 def main() -> None:
     st.title("📈 StockOracle")
     st.caption("Research tool — analysis and reasoning, not financial advice.")
@@ -345,6 +396,7 @@ def main() -> None:
 
         sma_data = _sma_regime_panel(conn, config.WATCHLIST)
         _portfolio_allocation_panel(conn, sma_data)
+        _data_health_panel(conn)
         _paper_portfolio_panel()
 
         if st.sidebar.button("Run pipeline now", help="Fetch fresh data and regenerate signals for this ticker."):

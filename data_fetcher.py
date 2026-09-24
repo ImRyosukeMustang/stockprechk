@@ -36,6 +36,62 @@ REQUEST_DELAY_SECONDS = 0.3
 YFINANCE_INFO_TIMEOUT_SECONDS = 30
 
 
+def record_fetch_success(conn: sqlite3.Connection, ticker: str, fetch_type: str) -> None:
+    """Record a successful price, fundamentals, or news fetch."""
+    columns = {
+        "price": "last_price_fetch",
+        "prices": "last_price_fetch",
+        "fundamentals": "last_fundamentals_fetch",
+        "news": "last_news_fetch",
+    }
+    column = columns.get(fetch_type)
+    if column is None:
+        raise ValueError(f"Unknown fetch type: {fetch_type}")
+    conn.execute(
+        f"""
+        INSERT INTO data_health (ticker, {column}, consecutive_failures, last_error, updated_at)
+        VALUES (?, datetime('now'), 0, NULL, datetime('now'))
+        ON CONFLICT(ticker) DO UPDATE SET
+            {column} = datetime('now'),
+            consecutive_failures = 0,
+            last_error = NULL,
+            updated_at = datetime('now')
+        """,
+        (ticker,),
+    )
+
+
+def record_fetch_failure(conn: sqlite3.Connection, ticker: str, error: str) -> None:
+    """Record a failed fetch without interrupting the rest of the pipeline."""
+    conn.execute(
+        """
+        INSERT INTO data_health (ticker, consecutive_failures, last_error, updated_at)
+        VALUES (?, 1, ?, datetime('now'))
+        ON CONFLICT(ticker) DO UPDATE SET
+            consecutive_failures = data_health.consecutive_failures + 1,
+            last_error = excluded.last_error,
+            updated_at = datetime('now')
+        """,
+        (ticker, error[:1000]),
+    )
+
+
+def is_ticker_stale(conn: sqlite3.Connection, ticker: str, max_age_days: int = 3) -> bool:
+    """Return whether the latest successful price fetch is older than allowed."""
+    row = conn.execute(
+        "SELECT last_price_fetch FROM data_health WHERE ticker = ?", (ticker,)
+    ).fetchone()
+    if row is None or not row[0]:
+        return True
+    try:
+        fetched_at = datetime.fromisoformat(row[0].replace("Z", "+00:00"))
+    except ValueError:
+        return True
+    if fetched_at.tzinfo is None:
+        fetched_at = fetched_at.replace(tzinfo=timezone.utc)
+    return datetime.now(timezone.utc) - fetched_at > timedelta(days=max_age_days)
+
+
 # ---------------------------------------------------------------------------
 # Prices + fundamentals (yfinance)
 # ---------------------------------------------------------------------------
@@ -48,6 +104,7 @@ def fetch_prices(conn: sqlite3.Connection, ticker: str) -> int:
         import yfinance as yf
     except ImportError:
         log.warning("yfinance not installed — skipping price fetch for %s. `pip install yfinance`.", ticker)
+        record_fetch_failure(conn, ticker, "yfinance not installed")
         return 0
 
     try:
@@ -58,10 +115,12 @@ def fetch_prices(conn: sqlite3.Connection, ticker: str) -> int:
         time.sleep(0.5)
     except Exception as exc:  # network errors, rate limits, bad ticker, etc.
         log.error("Failed to fetch price history for %s: %s", ticker, exc)
+        record_fetch_failure(conn, ticker, str(exc))
         return 0
 
     if hist.empty:
         log.warning("yfinance returned no price data for %s", ticker)
+        record_fetch_failure(conn, ticker, "yfinance returned no price data")
         return 0
 
     rows = []
@@ -78,6 +137,7 @@ def fetch_prices(conn: sqlite3.Connection, ticker: str) -> int:
         )
 
     database.insert_price_bars(conn, ticker, rows)
+    record_fetch_success(conn, ticker, "prices")
     log.info("Fetched %d price bars for %s", len(rows), ticker)
     return len(rows)
 
@@ -88,6 +148,7 @@ def fetch_fundamentals(conn: sqlite3.Connection, ticker: str) -> bool:
         import yfinance as yf
     except ImportError:
         log.warning("yfinance not installed — skipping fundamentals fetch for %s.", ticker)
+        record_fetch_failure(conn, ticker, "yfinance not installed")
         return False
 
     executor = ThreadPoolExecutor(max_workers=1)
@@ -100,15 +161,18 @@ def fetch_fundamentals(conn: sqlite3.Connection, ticker: str) -> bool:
             ticker,
             YFINANCE_INFO_TIMEOUT_SECONDS,
         )
+        record_fetch_failure(conn, ticker, "fundamentals fetch timed out")
         return False
     except Exception as exc:
         log.error("Failed to fetch fundamentals for %s: %s", ticker, exc)
+        record_fetch_failure(conn, ticker, str(exc))
         return False
     finally:
         executor.shutdown(wait=False, cancel_futures=True)
 
     if not info:
         log.warning("yfinance returned no fundamentals info for %s", ticker)
+        record_fetch_failure(conn, ticker, "yfinance returned no fundamentals info")
         return False
 
     today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
@@ -133,6 +197,7 @@ def fetch_fundamentals(conn: sqlite3.Connection, ticker: str) -> bool:
         raw_json=json.dumps(info, default=str),
     )
     log.info("Fetched fundamentals snapshot for %s", ticker)
+    record_fetch_success(conn, ticker, "fundamentals")
     return True
 
 
@@ -148,6 +213,7 @@ def fetch_google_news(conn: sqlite3.Connection, ticker: str, company_name: str |
         import feedparser
     except ImportError:
         log.warning("feedparser not installed — skipping Google News fetch for %s. `pip install feedparser`.", ticker)
+        record_fetch_failure(conn, ticker, "feedparser not installed")
         return 0
 
     query = f"{ticker} stock"
@@ -161,6 +227,7 @@ def fetch_google_news(conn: sqlite3.Connection, ticker: str, company_name: str |
         feed = feedparser.parse(url)
     except Exception as exc:
         log.error("Failed to fetch Google News for %s: %s", ticker, exc)
+        record_fetch_failure(conn, ticker, str(exc))
         return 0
 
     count = 0
@@ -180,6 +247,7 @@ def fetch_google_news(conn: sqlite3.Connection, ticker: str, company_name: str |
         count += 1
 
     log.info("Fetched %d Google News items for %s", count, ticker)
+    record_fetch_success(conn, ticker, "news")
     return count
 
 
@@ -194,6 +262,7 @@ def fetch_newsapi(conn: sqlite3.Connection, ticker: str, company_name: str | Non
         import requests
     except ImportError:
         log.warning("requests not installed — skipping NewsAPI fetch for %s. `pip install requests`.", ticker)
+        record_fetch_failure(conn, ticker, "requests not installed")
         return 0
 
     query = company_name or ticker
@@ -212,6 +281,7 @@ def fetch_newsapi(conn: sqlite3.Connection, ticker: str, company_name: str | Non
         data = resp.json()
     except Exception as exc:
         log.error("Failed to fetch NewsAPI results for %s: %s", ticker, exc)
+        record_fetch_failure(conn, ticker, str(exc))
         return 0
 
     articles = data.get("articles", [])
@@ -229,6 +299,7 @@ def fetch_newsapi(conn: sqlite3.Connection, ticker: str, company_name: str | Non
         count += 1
 
     log.info("Fetched %d NewsAPI items for %s", count, ticker)
+    record_fetch_success(conn, ticker, "news")
     return count
 
 
@@ -289,19 +360,50 @@ def fetch_reddit_posts(conn: sqlite3.Connection, ticker: str) -> int:
 # Orchestration for a single ticker (main.py drives calling this per ticker)
 # ---------------------------------------------------------------------------
 
-def fetch_all_for_ticker(conn: sqlite3.Connection, ticker: str, company_name: str | None = None) -> dict[str, int]:
+def fetch_all_for_ticker(
+    conn: sqlite3.Connection,
+    ticker: str,
+    company_name: str | None = None,
+    include_fundamentals: bool = True,
+    include_news: bool = True,
+) -> dict[str, int]:
     """Run every fetcher for one ticker and return a dict of source -> item count.
     Each source is independently best-effort: one failing doesn't stop the others."""
     results: dict[str, int] = {}
     results["prices"] = fetch_prices(conn, ticker)
     time.sleep(REQUEST_DELAY_SECONDS)
-    results["fundamentals"] = int(fetch_fundamentals(conn, ticker))
-    time.sleep(REQUEST_DELAY_SECONDS)
-    results["google_news"] = fetch_google_news(conn, ticker, company_name)
+    if include_fundamentals:
+        results["fundamentals"] = int(fetch_fundamentals(conn, ticker))
+        time.sleep(REQUEST_DELAY_SECONDS)
+    if include_news:
+        results.update(fetch_news_for_ticker(conn, ticker, company_name))
+    return results
+
+
+def fetch_prices_only(conn: sqlite3.Connection, ticker: str) -> dict[str, int]:
+    """Fast daily path: fetch only price history."""
+    return {"prices": fetch_prices(conn, ticker)}
+
+
+def fetch_news_for_ticker(
+    conn: sqlite3.Connection, ticker: str, company_name: str | None = None
+) -> dict[str, int]:
+    """Fetch all configured news sources for one ticker."""
+    results = {"google_news": fetch_google_news(conn, ticker, company_name)}
     time.sleep(REQUEST_DELAY_SECONDS)
     results["newsapi"] = fetch_newsapi(conn, ticker, company_name)
     time.sleep(REQUEST_DELAY_SECONDS)
     results["reddit"] = fetch_reddit_posts(conn, ticker)
+    return results
+
+
+def fetch_weekly_extras(
+    conn: sqlite3.Connection, ticker: str, company_name: str | None = None
+) -> dict[str, int]:
+    """Fetch fundamentals and news for a weekly/manual refresh."""
+    results = {"fundamentals": int(fetch_fundamentals(conn, ticker))}
+    time.sleep(REQUEST_DELAY_SECONDS)
+    results.update(fetch_news_for_ticker(conn, ticker, company_name))
     return results
 
 
@@ -321,6 +423,41 @@ def fetch_all_finnhub_for_ticker(conn: sqlite3.Connection, ticker: str) -> dict[
     except Exception as exc:
         log.error("Finnhub fetch failed for %s; continuing: %s", ticker, exc)
     return results
+
+
+def fetch_finnhub_news_for_ticker(conn: sqlite3.Connection, ticker: str) -> int:
+    """Fetch only Finnhub news for a ticker."""
+    try:
+        import finnhub_fetcher
+        count = finnhub_fetcher.fetch_company_news(conn, ticker)
+        if count or getattr(finnhub_fetcher, "FINNHUB_API_KEY", None):
+            record_fetch_success(conn, ticker, "news")
+        return count
+    except ImportError:
+        log.warning("Finnhub fetcher is unavailable — skipping news for %s.", ticker)
+        return 0
+    except Exception as exc:
+        log.error("Finnhub news fetch failed for %s; continuing: %s", ticker, exc)
+        record_fetch_failure(conn, ticker, str(exc))
+        return 0
+
+
+def fetch_finnhub_weekly_extras(conn: sqlite3.Connection, ticker: str) -> dict[str, int]:
+    """Fetch Finnhub financials and company profile without fetching news."""
+    try:
+        import finnhub_fetcher
+        financials = int(bool(finnhub_fetcher.fetch_basic_financials(conn, ticker)))
+        profile = int(bool(finnhub_fetcher.fetch_company_profile(conn, ticker)))
+        if financials:
+            record_fetch_success(conn, ticker, "fundamentals")
+        return {"finnhub_financials": financials, "finnhub_profile": profile}
+    except ImportError:
+        log.warning("Finnhub fetcher is unavailable — skipping weekly extras for %s.", ticker)
+        return {"finnhub_financials": 0, "finnhub_profile": 0}
+    except Exception as exc:
+        log.error("Finnhub weekly extras failed for %s; continuing: %s", ticker, exc)
+        record_fetch_failure(conn, ticker, str(exc))
+        return {"finnhub_financials": 0, "finnhub_profile": 0}
 
 
 def fetch_finnhub_earnings_calendar(conn: sqlite3.Connection) -> int:

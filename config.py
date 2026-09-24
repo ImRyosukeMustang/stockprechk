@@ -34,6 +34,8 @@ BASE_DIR = Path(__file__).resolve().parent
 # ---------------------------------------------------------------------------
 FINNHUB_ENABLED: bool = True
 FINNHUB_MAX_TICKERS_PER_RUN: int = 50
+FUNDAMENTALS_REFRESH_DAYS: int = 7
+NEWS_MAX_TICKERS_PER_RUN: int = 50
 
 # ---------------------------------------------------------------------------
 # SAFETY SWITCH — the whole project must respect this. No module should ever
@@ -139,6 +141,8 @@ TRANSACTION_COST_PCT: float = 0.001  # 10 bps per trade side (commission + slipp
 PRICE_HISTORY_PERIOD: str = "5y"     # yfinance period string
 PRICE_HISTORY_INTERVAL: str = "1d"   # yfinance interval string
 NEWS_LOOKBACK_HOURS: int = 48
+MIN_AVG_DOLLAR_VOLUME: float = 10_000_000
+LIQUIDITY_LOOKBACK_DAYS: int = 20
 REDDIT_SUBREDDITS: list[str] = ["stocks", "wallstreetbets", "investing"]
 REDDIT_POST_LIMIT: int = 25
 
