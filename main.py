@@ -17,6 +17,8 @@ Usage:
 from __future__ import annotations
 
 import sys
+import time
+from collections.abc import Iterator
 from datetime import date, timedelta
 
 import config
@@ -46,6 +48,12 @@ COMPANY_NAMES: dict[str, str] = {
 }
 
 
+def _chunks(items: list[str], size: int) -> Iterator[list[str]]:
+    """Yield successive ticker chunks of at most ``size`` items."""
+    for start in range(0, len(items), size):
+        yield items[start : start + size]
+
+
 def run_pipeline(tickers: list[str] | None = None) -> dict[str, dict[str, int]]:
     """
     Run one full Phase-1 pipeline pass: fetch prices/fundamentals/news/reddit
@@ -58,6 +66,8 @@ def run_pipeline(tickers: list[str] | None = None) -> dict[str, dict[str, int]]:
     database.init_db()
 
     summary: dict[str, dict[str, int]] = {}
+    finnhub_tickers = set(tickers[: config.FINNHUB_MAX_TICKERS_PER_RUN])
+    successful_count = 0
 
     with database.get_connection() as conn:
         run_id = database.start_pipeline_run(conn)
@@ -71,49 +81,57 @@ def run_pipeline(tickers: list[str] | None = None) -> dict[str, dict[str, int]]:
 
         try:
             macro_fetcher.fetch_all_macro(conn, date.today() - timedelta(days=365 * 5))
-            for index, ticker in enumerate(tickers, start=1):
-                try:
-                    company_name = COMPANY_NAMES.get(ticker.upper())
-                    log.info("--- %s (%d/%d) ---", ticker, index, len(tickers))
-                    fetch_counts = data_fetcher.fetch_all_for_ticker(conn, ticker, company_name)
+            for chunk_number, chunk in enumerate(_chunks(tickers, 40), start=1):
+                for index, ticker in enumerate(chunk, start=(chunk_number - 1) * 40 + 1):
+                    try:
+                        company_name = COMPANY_NAMES.get(ticker.upper())
+                        log.info("--- %s (%d/%d) ---", ticker, index, len(tickers))
+                        fetch_counts = data_fetcher.fetch_all_for_ticker(conn, ticker, company_name)
+                        if config.FINNHUB_ENABLED and ticker in finnhub_tickers:
+                            fetch_counts.update(data_fetcher.fetch_all_finnhub_for_ticker(conn, ticker))
 
-                    # Phase 2: turn what we just fetched (plus prior history) into signals.
-                    sentiment_results = sentiment.analyze_ticker_sentiment(conn, ticker)
-                    sentiment.categorize_news_events(conn, ticker)
-                    technical_count = technical.compute_indicators_for_ticker(conn, ticker)
-                    pattern_detector.detect_and_store(conn, ticker)
+                        # Phase 2: turn what we just fetched (plus prior history) into signals.
+                        sentiment_results = sentiment.analyze_ticker_sentiment(conn, ticker)
+                        sentiment.categorize_news_events(conn, ticker)
+                        technical_count = technical.compute_indicators_for_ticker(conn, ticker)
+                        pattern_detector.detect_and_store(conn, ticker)
 
-                    # Phase 3: retrain/refresh the predictor and combine everything
-                    # into a BUY/SELL/HOLD call via decision_engine.
-                    train_summary = predictor.train_model(conn, ticker)
-                    probability_up = predictor.predict_latest(conn, ticker) if train_summary else None
-                    decision = decision_engine.generate_signal(conn, ticker)
-                    pattern = pattern_analysis.compute_probability(conn, ticker)
-                    if decision.get("signal_id"):
-                        enriched_reasoning = (
-                            f"{decision['reasoning']} | Pattern memory: {pattern['reasoning']} "
-                            f"Probability up={pattern['probability_up']:.0%}, confidence={pattern['confidence']:.0%}."
-                        )
-                        database.update_signal_reasoning(conn, decision["signal_id"], enriched_reasoning)
+                        # Phase 3: retrain/refresh the predictor and combine everything
+                        # into a BUY/SELL/HOLD call via decision_engine.
+                        train_summary = predictor.train_model(conn, ticker)
+                        probability_up = predictor.predict_latest(conn, ticker) if train_summary else None
+                        decision = decision_engine.generate_signal(conn, ticker)
+                        pattern = pattern_analysis.compute_probability(conn, ticker)
+                        if decision.get("signal_id"):
+                            enriched_reasoning = (
+                                f"{decision['reasoning']} | Pattern memory: {pattern['reasoning']} "
+                                f"Probability up={pattern['probability_up']:.0%}, confidence={pattern['confidence']:.0%}."
+                            )
+                            database.update_signal_reasoning(conn, decision["signal_id"], enriched_reasoning)
 
-                    summary[ticker] = {
-                        **fetch_counts,
-                        "sentiment_news": int(sentiment_results["news"]),
-                        "sentiment_reddit": int(sentiment_results["reddit"]),
-                        "sentiment_llm": int(sentiment_results["llm"]),
-                        "technical_dates": technical_count,
-                        "trained": bool(train_summary),
-                        "probability_up": probability_up,
-                        "signal": decision["signal"],
-                        "confidence": decision["confidence"],
-                        "pattern_probability_up": pattern["probability_up"],
-                        "pattern_confidence": pattern["confidence"],
-                    }
-                except Exception as exc:
-                    log.error("Ticker %s failed; continuing: %s", ticker, exc)
-                if index % 10 == 0 or index == len(tickers):
-                    log.info("Progress: %d/%d tickers complete", index, len(tickers))
+                        summary[ticker] = {
+                            **fetch_counts,
+                            "sentiment_news": int(sentiment_results["news"]),
+                            "sentiment_reddit": int(sentiment_results["reddit"]),
+                            "sentiment_llm": int(sentiment_results["llm"]),
+                            "technical_dates": technical_count,
+                            "trained": bool(train_summary),
+                            "probability_up": probability_up,
+                            "signal": decision["signal"],
+                            "confidence": decision["confidence"],
+                            "pattern_probability_up": pattern["probability_up"],
+                            "pattern_confidence": pattern["confidence"],
+                        }
+                        successful_count += 1
+                    except Exception as exc:
+                        log.error("Ticker %s failed; continuing: %s", ticker, exc)
                 conn.commit()
+                processed = min(chunk_number * 40, len(tickers))
+                log.info("[%d/%d] Chunk %d complete", processed, len(tickers), chunk_number)
+                if processed < len(tickers):
+                    time.sleep(5)
+            if config.FINNHUB_ENABLED:
+                data_fetcher.fetch_finnhub_earnings_calendar(conn)
         except Exception as exc:
             database.finish_pipeline_run(conn, run_id, status="failed", detail=str(exc))
             log.error("Pipeline run #%d failed: %s", run_id, exc)
@@ -122,6 +140,7 @@ def run_pipeline(tickers: list[str] | None = None) -> dict[str, dict[str, int]]:
             database.finish_pipeline_run(conn, run_id, status="success", detail=None)
             log.info("Pipeline run #%d finished successfully.", run_id)
 
+    log.info("Pipeline complete: %d/%d tickers succeeded", successful_count, len(tickers))
     _log_summary(summary)
     return summary
 
@@ -138,43 +157,58 @@ def run_pipeline_sma_only(tickers: list[str] | None = None) -> dict:
     tickers = tickers or config.WATCHLIST
     database.init_db()
     signals: dict[str, dict] = {}
+    successful_count = 0
+    finnhub_tickers = set(tickers[: config.FINNHUB_MAX_TICKERS_PER_RUN])
 
     with database.get_connection() as conn:
         journal.backfill_forward_returns(conn)
         log.info("Starting SMA-only pipeline for %d tickers", len(tickers))
-        for index, ticker in enumerate(tickers, start=1):
+        for chunk_number, chunk in enumerate(_chunks(tickers, 40), start=1):
             try:
-                company_name = COMPANY_NAMES.get(ticker.upper())
-                log.info("--- %s (%d/%d) ---", ticker, index, len(tickers))
-                data_fetcher.fetch_all_for_ticker(conn, ticker, company_name)
-                technical.compute_indicators_for_ticker(conn, ticker)
-                signals[ticker] = decision_engine.generate_sma_only_signal(conn, ticker)
-                pattern_detector.detect_and_store(conn, ticker)
-                pattern = pattern_analysis.compute_probability(conn, ticker)
-                latest_prices = database.get_price_history(conn, ticker, limit=1)
-                close_price = float(latest_prices[0]["close"]) if latest_prices else None
-                signal = signals[ticker]
-                journal.log_signal(
-                    conn,
-                    ticker,
-                    signal["regime"],
-                    signal["sma50"],
-                    signal["sma200"],
-                    close_price,
-                    "BUY" if signal["regime"] == "bullish" else "SELL",
-                )
-                if signal.get("signal_id"):
-                    database.update_signal_reasoning(
-                        conn,
-                        signal["signal_id"],
-                        f"{signal.get('reasoning', '')} | Pattern memory: {pattern['reasoning']} "
-                        f"Probability up={pattern['probability_up']:.0%}, confidence={pattern['confidence']:.0%}.",
-                    )
+                for index, ticker in enumerate(chunk, start=(chunk_number - 1) * 40 + 1):
+                    try:
+                        company_name = COMPANY_NAMES.get(ticker.upper())
+                        log.info("--- %s (%d/%d) ---", ticker, index, len(tickers))
+                        data_fetcher.fetch_all_for_ticker(conn, ticker, company_name)
+                        if config.FINNHUB_ENABLED and ticker in finnhub_tickers:
+                            data_fetcher.fetch_all_finnhub_for_ticker(conn, ticker)
+                        technical.compute_indicators_for_ticker(conn, ticker)
+                        signals[ticker] = decision_engine.generate_sma_only_signal(conn, ticker)
+                        pattern_detector.detect_and_store(conn, ticker)
+                        pattern = pattern_analysis.compute_probability(conn, ticker)
+                        latest_prices = database.get_price_history(conn, ticker, limit=1)
+                        close_price = float(latest_prices[0]["close"]) if latest_prices else None
+                        signal = signals[ticker]
+                        journal.log_signal(
+                            conn,
+                            ticker,
+                            signal["regime"],
+                            signal["sma50"],
+                            signal["sma200"],
+                            close_price,
+                            "BUY" if signal["regime"] == "bullish" else "SELL",
+                        )
+                        if signal.get("signal_id"):
+                            database.update_signal_reasoning(
+                                conn,
+                                signal["signal_id"],
+                                f"{signal.get('reasoning', '')} | Pattern memory: {pattern['reasoning']} "
+                                f"Probability up={pattern['probability_up']:.0%}, confidence={pattern['confidence']:.0%}.",
+                            )
+                        successful_count += 1
+                    except Exception as exc:
+                        log.error("Ticker %s failed; continuing: %s", ticker, exc)
+                conn.commit()
             except Exception as exc:
-                log.error("Ticker %s failed; continuing: %s", ticker, exc)
-            if index % 10 == 0 or index == len(tickers):
-                log.info("SMA-only progress: %d/%d tickers complete", index, len(tickers))
-            conn.commit()
+                log.error("Chunk %d failed; continuing: %s", chunk_number, exc)
+            processed = min(chunk_number * 40, len(tickers))
+            log.info("[%d/%d] Chunk %d complete", processed, len(tickers), chunk_number)
+            if processed < len(tickers):
+                time.sleep(5)
+
+        log.info("Pipeline complete: %d/%d tickers succeeded", successful_count, len(tickers))
+        if config.FINNHUB_ENABLED:
+            data_fetcher.fetch_finnhub_earnings_calendar(conn)
 
         allocation = portfolio.compute_portfolio_allocation(signals)
         portfolio_summary = portfolio.compute_portfolio_summary(allocation)

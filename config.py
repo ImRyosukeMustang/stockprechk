@@ -30,6 +30,12 @@ except ImportError:
 BASE_DIR = Path(__file__).resolve().parent
 
 # ---------------------------------------------------------------------------
+# Finnhub
+# ---------------------------------------------------------------------------
+FINNHUB_ENABLED: bool = True
+FINNHUB_MAX_TICKERS_PER_RUN: int = 50
+
+# ---------------------------------------------------------------------------
 # SAFETY SWITCH — the whole project must respect this. No module should ever
 # place a real order, submit a real trade, or otherwise touch real money
 # while DRY_RUN is True. This starts True and should only be flipped by a
@@ -69,16 +75,20 @@ LLM_MODEL_CHEAP: str = "gpt-4o-mini"   # sentiment tagging, quick classification
 LLM_MODEL_DEEP: str = "gpt-4o"         # full thesis writing, deep reasoning
 
 # ---------------------------------------------------------------------------
-# Watchlist — load the generated S&P 100 list when available, with a small
-# fallback so the project remains usable before the list is downloaded.
 # ---------------------------------------------------------------------------
-_TICKERS_FILE = BASE_DIR / "top_100_tickers.txt"
+# Watchlist — load the expanded universe, then S&P 500, then a small fallback.
+# ---------------------------------------------------------------------------
+_TICKERS_FILE = BASE_DIR / "universe_tickers.txt"
+if not _TICKERS_FILE.exists():
+    _TICKERS_FILE = BASE_DIR / "sp500_tickers.txt"
 if _TICKERS_FILE.exists():
     WATCHLIST: list[str] = [
         line.strip().upper()
         for line in _TICKERS_FILE.read_text(encoding="utf-8").splitlines()
-        if line.strip()
+        if line.strip() and not line.startswith("#")
     ]
+    _log_init = logging.getLogger(__name__)
+    _log_init.info("Loaded %d tickers from %s", len(WATCHLIST), _TICKERS_FILE.name)
 else:
     WATCHLIST = ["AAPL", "MSFT", "NVDA", "GOOGL", "AMZN"]
 
@@ -87,6 +97,7 @@ else:
 # so config.py is the single source of truth from day one)
 # ---------------------------------------------------------------------------
 # Portfolio / SMA-only mode
+MAX_POSITIONS: int = 20  # max number of concurrent positions
 MAX_POSITION_PCT: float = 0.20
 MAX_TOTAL_EXPOSURE: float = 1.00
 PORTFOLIO_MODE: str = "sma_only"  # or "ml"

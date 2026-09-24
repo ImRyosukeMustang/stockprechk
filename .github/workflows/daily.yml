@@ -9,7 +9,7 @@ on:
 jobs:
   run-pipeline:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 120
 
     steps:
       - name: Checkout code
@@ -41,6 +41,7 @@ jobs:
         env:
           ALPACA_API_KEY: ${{ secrets.ALPACA_API_KEY }}
           ALPACA_SECRET_KEY: ${{ secrets.ALPACA_SECRET_KEY }}
+          FINNHUB_API_KEY: ${{ secrets.FINNHUB_API_KEY }}
         run: python scheduler.py --once
 
       - name: Print journal summary
@@ -55,4 +56,4 @@ jobs:
         with:
           name: stockoracle-db-run-${{ github.run_number }}
           path: stockoracle.db
-          retention-days: 90
+          retention-days: 30
