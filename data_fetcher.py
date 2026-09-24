@@ -55,6 +55,7 @@ def fetch_prices(conn: sqlite3.Connection, ticker: str) -> int:
             period=config.PRICE_HISTORY_PERIOD,
             interval=config.PRICE_HISTORY_INTERVAL,
         )
+        time.sleep(0.5)
     except Exception as exc:  # network errors, rate limits, bad ticker, etc.
         log.error("Failed to fetch price history for %s: %s", ticker, exc)
         return 0
@@ -302,6 +303,38 @@ def fetch_all_for_ticker(conn: sqlite3.Connection, ticker: str, company_name: st
     time.sleep(REQUEST_DELAY_SECONDS)
     results["reddit"] = fetch_reddit_posts(conn, ticker)
     return results
+
+
+def fetch_all_finnhub_for_ticker(conn: sqlite3.Connection, ticker: str) -> dict[str, int]:
+    """Run Finnhub's ticker-scoped fetchers with graceful degradation."""
+    try:
+        import finnhub_fetcher
+    except ImportError:
+        log.warning("Finnhub fetcher is unavailable — skipping %s.", ticker)
+        return {"finnhub_news": 0, "finnhub_financials": 0, "finnhub_profile": 0}
+
+    results: dict[str, int] = {"finnhub_news": 0, "finnhub_financials": 0, "finnhub_profile": 0}
+    try:
+        results["finnhub_news"] = finnhub_fetcher.fetch_company_news(conn, ticker)
+        results["finnhub_financials"] = int(bool(finnhub_fetcher.fetch_basic_financials(conn, ticker)))
+        results["finnhub_profile"] = int(bool(finnhub_fetcher.fetch_company_profile(conn, ticker)))
+    except Exception as exc:
+        log.error("Finnhub fetch failed for %s; continuing: %s", ticker, exc)
+    return results
+
+
+def fetch_finnhub_earnings_calendar(conn: sqlite3.Connection) -> int:
+    """Fetch the watchlist earnings calendar once for the current run."""
+    try:
+        import finnhub_fetcher
+    except ImportError:
+        log.warning("Finnhub fetcher is unavailable — skipping earnings calendar.")
+        return 0
+    try:
+        return finnhub_fetcher.fetch_earnings_calendar(conn)
+    except Exception as exc:
+        log.error("Finnhub earnings calendar failed; continuing: %s", exc)
+        return 0
 
 
 if __name__ == "__main__":

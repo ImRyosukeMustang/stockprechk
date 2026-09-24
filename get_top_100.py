@@ -38,7 +38,7 @@ def get_sp100_tickers() -> list[str]:
             if "symbol" not in label and "ticker" not in label:
                 continue
             values = [_normalise_ticker(value) for value in table[column].tolist()]
-            values = [value for value in values if value is not None]
+            values = [t for t in values if t]
             if len(values) >= 80:
                 candidates = values
                 break

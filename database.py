@@ -55,6 +55,22 @@ CREATE TABLE IF NOT EXISTS news (
 );
  
 CREATE INDEX IF NOT EXISTS idx_news_ticker ON news(ticker);
+
+CREATE TABLE IF NOT EXISTS earnings_calendar (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    ticker TEXT NOT NULL,
+    earnings_date TEXT NOT NULL,
+    eps_estimate REAL,
+    eps_actual REAL,
+    revenue_estimate REAL,
+    revenue_actual REAL,
+    hour TEXT,
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    UNIQUE(ticker, earnings_date)
+);
+
+CREATE INDEX IF NOT EXISTS idx_earnings_calendar_ticker_date
+    ON earnings_calendar(ticker, earnings_date);
  
 CREATE TABLE IF NOT EXISTS reddit_posts (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -362,14 +378,46 @@ def insert_news_item(
     url: str,
     published_at: str | None = None,
     summary: str | None = None,
-) -> None:
-    conn.execute(
+) -> bool:
+    cursor = conn.execute(
         """
         INSERT OR IGNORE INTO news (ticker, source, title, url, published_at, summary)
         VALUES (?, ?, ?, ?, ?, ?)
         """,
         (ticker, source, title, url, published_at, summary),
     )
+    return cursor.rowcount > 0
+
+
+def insert_earnings_calendar_entry(
+    conn: sqlite3.Connection,
+    ticker: str,
+    earnings_date: str,
+    eps_estimate: float | None,
+    eps_actual: float | None,
+    revenue_estimate: float | None,
+    revenue_actual: float | None,
+    hour: str | None,
+) -> bool:
+    """Insert one earnings entry and return whether it was newly inserted."""
+    cursor = conn.execute(
+        """
+        INSERT OR IGNORE INTO earnings_calendar
+            (ticker, earnings_date, eps_estimate, eps_actual,
+             revenue_estimate, revenue_actual, hour)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            ticker,
+            earnings_date,
+            eps_estimate,
+            eps_actual,
+            revenue_estimate,
+            revenue_actual,
+            hour,
+        ),
+    )
+    return cursor.rowcount > 0
  
  
 def insert_reddit_post(

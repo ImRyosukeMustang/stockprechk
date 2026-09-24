@@ -210,7 +210,7 @@ def run_pipeline_sma_only(tickers: list[str] | None = None) -> dict:
         if config.FINNHUB_ENABLED:
             data_fetcher.fetch_finnhub_earnings_calendar(conn)
 
-        allocation = portfolio.compute_portfolio_allocation(signals)
+        allocation = portfolio.compute_portfolio_allocation(conn, signals)
         portfolio_summary = portfolio.compute_portfolio_summary(allocation)
 
     log.info("SMA-only pipeline complete")

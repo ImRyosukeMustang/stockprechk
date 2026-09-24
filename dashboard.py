@@ -250,9 +250,9 @@ def _sma_regime_panel(conn, tickers: list[str]) -> dict[str, dict]:
     return data
 
 
-def _portfolio_allocation_panel(sma_data: dict[str, dict]) -> None:
+def _portfolio_allocation_panel(conn, sma_data: dict[str, dict]) -> None:
     """Show equal-weight SMA-only allocation and cash remainder."""
-    allocation = portfolio.compute_portfolio_allocation(sma_data)
+    allocation = portfolio.compute_portfolio_allocation(conn, sma_data)
     summary = portfolio.compute_portfolio_summary(allocation)
     st.subheader("Portfolio Allocation")
     st.dataframe(
@@ -344,7 +344,7 @@ def main() -> None:
         ticker = st.sidebar.selectbox("Ticker", watchlist_tickers or config.WATCHLIST)
 
         sma_data = _sma_regime_panel(conn, config.WATCHLIST)
-        _portfolio_allocation_panel(sma_data)
+        _portfolio_allocation_panel(conn, sma_data)
         _paper_portfolio_panel()
 
         if st.sidebar.button("Run pipeline now", help="Fetch fresh data and regenerate signals for this ticker."):

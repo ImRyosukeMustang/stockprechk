@@ -99,6 +99,8 @@ else:
 # Portfolio / SMA-only mode
 MAX_POSITIONS: int = 20  # max number of concurrent positions
 MAX_POSITION_PCT: float = 0.20
+MAX_POSITIONS_PER_SECTOR: int = 3
+MAX_SECTOR_EXPOSURE: float = 0.30
 MAX_TOTAL_EXPOSURE: float = 1.00
 PORTFOLIO_MODE: str = "sma_only"  # or "ml"
 MIN_CONFIDENCE_TO_ACT: float = 0.60  # signals below this confidence become HOLD

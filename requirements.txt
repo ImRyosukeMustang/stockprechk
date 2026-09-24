@@ -2,6 +2,7 @@
 yfinance
 feedparser
 requests
+finnhub-python
 praw
 python-dotenv
 

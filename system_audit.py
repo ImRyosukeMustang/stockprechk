@@ -403,7 +403,7 @@ def audit_portfolio(conn: sqlite3.Connection) -> None:
     # Test with all bullish
     signals = {t: {"regime": "bullish", "position_size": 1.0}
                for t in config.WATCHLIST}
-    alloc = portfolio.compute_portfolio_allocation(signals)
+    alloc = portfolio.compute_portfolio_allocation(conn, signals)
 
     total = sum(alloc.values())
     check(
@@ -427,7 +427,7 @@ def audit_portfolio(conn: sqlite3.Connection) -> None:
         "GOOGL": {"regime": "bearish", "position_size": 0.0},
         "AMZN": {"regime": "bearish", "position_size": 0.0},
     }
-    alloc2 = portfolio.compute_portfolio_allocation(signals_mixed)
+    alloc2 = portfolio.compute_portfolio_allocation(conn, signals_mixed)
 
     bullish_weights = [alloc2.get(t, 0) for t in ["AAPL", "MSFT"]]
     bearish_weights = [alloc2.get(t, 0) for t in ["NVDA", "GOOGL", "AMZN"]]

@@ -345,6 +345,7 @@ def generate_sma_only_signal(conn: sqlite3.Connection, ticker: str) -> dict:
             "regime": "unknown",
             "sma50": None,
             "sma200": None,
+            "strength": 0.0,
             "position_size": 0.0,
             "reasoning": "No daily price history available for SMA(50/200).",
             "signal_id": None,
@@ -381,12 +382,15 @@ def generate_sma_only_signal(conn: sqlite3.Connection, ticker: str) -> dict:
         confidence = 1.0
         reasoning = f"SMA bearish (SMA50={sma50:.2f} <= SMA200={sma200:.2f})."
 
+    strength = (sma50 - sma200) / sma200 if sma50 and sma200 else 0.0
+
     result = {
         "ticker": ticker,
         "date": latest_date,
         "regime": regime,
         "sma50": sma50,
         "sma200": sma200,
+        "strength": strength,
         "position_size": position_size,
         "reasoning": reasoning,
         "signal_id": database.insert_signal(
