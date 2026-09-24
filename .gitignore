@@ -4,3 +4,20 @@ finnhub_keys.py
 *.db
 *.db-journal
 *.db.backup
+
+# Databases (too large for git)
+*.db
+*.db-journal
+*.db.backup
+
+# Model artifacts
+models/
+
+# Generated reports
+backtests/
+
+# Secrets
+.env
+alpaca_keys.py
+finnhub_keys.py
+gemini_keys.py
