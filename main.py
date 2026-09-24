@@ -31,6 +31,7 @@ import predictor
 import portfolio
 import pattern_analysis
 import pattern_detector
+import risk_controls
 import sentiment
 import technical
 
@@ -52,6 +53,19 @@ def _chunks(items: list[str], size: int) -> Iterator[list[str]]:
     """Yield successive ticker chunks of at most ``size`` items."""
     for start in range(0, len(items), size):
         yield items[start : start + size]
+
+
+def _latest_prices(conn, tickers: set[str]) -> dict[str, float]:
+    """Load the latest stored daily close for each ticker."""
+    prices: dict[str, float] = {}
+    for ticker in tickers:
+        row = conn.execute(
+            "SELECT close FROM prices WHERE ticker = ? ORDER BY date DESC LIMIT 1",
+            (ticker,),
+        ).fetchone()
+        if row is not None and row["close"] is not None:
+            prices[ticker] = float(row["close"])
+    return prices
 
 
 def run_pipeline(tickers: list[str] | None = None) -> dict[str, dict[str, int]]:
@@ -237,7 +251,32 @@ def run_pipeline_sma_only(
         if config.FINNHUB_ENABLED:
             data_fetcher.fetch_finnhub_earnings_calendar(conn)
 
-        allocation = portfolio.compute_portfolio_allocation(conn, signals)
+        target_allocation = portfolio.compute_portfolio_allocation(conn, signals)
+        tracked_tickers = {
+            row["ticker"] for row in conn.execute("SELECT ticker FROM open_positions").fetchall()
+        }
+        current_prices = _latest_prices(conn, set(target_allocation) | tracked_tickers)
+        allocation = risk_controls.apply_risk_controls(
+            conn, target_allocation, current_prices
+        )
+        exits = risk_controls.sync_open_positions(conn, allocation, current_prices)
+        vix, _ = risk_controls.check_vix_regime(conn)
+        total_value = risk_controls.get_portfolio_value(conn, current_prices)
+        peak_value = max(risk_controls.get_portfolio_peak(conn), total_value)
+        position_count = len([weight for weight in allocation.values() if weight > 0])
+        notes = f"Exits: {', '.join(exits)}" if exits else None
+        conn.execute(
+            """
+            INSERT OR REPLACE INTO portfolio_history
+                (date, total_value, cash, peak_value, n_positions, vix_at_close, notes)
+            VALUES (date('now'), ?, ?, ?, ?, ?, ?)
+            """,
+            (total_value, max(0.0, total_value - sum(
+                float(row["shares"]) * current_prices[row["ticker"]]
+                for row in conn.execute("SELECT ticker, shares FROM open_positions").fetchall()
+                if row["ticker"] in current_prices
+            )), peak_value, position_count, vix, notes),
+        )
         portfolio_summary = portfolio.compute_portfolio_summary(allocation)
 
     log.info("SMA-only pipeline complete")

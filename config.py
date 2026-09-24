@@ -110,6 +110,16 @@ STOP_LOSS_PCT: float = 0.08
 TAKE_PROFIT_PCT: float = 0.15
 
 # ---------------------------------------------------------------------------
+# Risk Controls
+# ---------------------------------------------------------------------------
+PORTFOLIO_STOP_LOSS_PCT: float = 0.15
+POSITION_STOP_LOSS_PCT: float = 0.10
+VIX_HIGH: float = 30.0
+VIX_EXTREME: float = 40.0
+MAX_HOLDING_DAYS: int = 60
+MIN_HOLDING_RETURN: float = 0.02
+
+# ---------------------------------------------------------------------------
 # Volatility targeting (used by vol_target.py for position sizing)
 # ---------------------------------------------------------------------------
 TARGET_VOL: float = 0.15           # annualized target volatility

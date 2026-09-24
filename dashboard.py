@@ -23,6 +23,7 @@ import database
 import alpaca_account
 import pattern_analysis
 import portfolio
+import risk_controls
 
 log = config.get_logger(__name__)
 
@@ -379,6 +380,69 @@ def _data_health_panel(conn) -> None:
         st.caption("No recent fetch failures.")
 
 
+def _risk_status_panel(conn) -> None:
+    """Show portfolio drawdown, VIX regime, stop-loss watch, and exits."""
+    st.subheader("Risk Status")
+    history = conn.execute(
+        "SELECT * FROM portfolio_history ORDER BY date DESC, id DESC LIMIT 1"
+    ).fetchone()
+    positions = conn.execute(
+        "SELECT ticker, entry_date, entry_price, shares FROM open_positions ORDER BY ticker"
+    ).fetchall()
+    current_prices = {}
+    for row in positions:
+        price = conn.execute(
+            "SELECT close FROM prices WHERE ticker = ? ORDER BY date DESC LIMIT 1",
+            (row["ticker"],),
+        ).fetchone()
+        if price is not None:
+            current_prices[row["ticker"]] = float(price["close"])
+
+    if history is None:
+        st.info("No portfolio history yet. Run the SMA-only pipeline to record risk status.")
+    else:
+        current_value = risk_controls.get_portfolio_value(conn, current_prices)
+        peak_value = risk_controls.get_portfolio_peak(conn)
+        threshold = peak_value * (1.0 - config.PORTFOLIO_STOP_LOSS_PCT)
+        columns = st.columns(3)
+        columns[0].metric("Portfolio value", f"${current_value:,.2f}")
+        columns[1].metric("Peak value", f"${peak_value:,.2f}")
+        columns[2].metric("Stop-loss threshold", f"${threshold:,.2f}")
+        if peak_value > 0:
+            st.progress(min(1.0, max(0.0, current_value / peak_value)))
+            st.caption(f"Stop-loss activates at {config.PORTFOLIO_STOP_LOSS_PCT:.0%} below peak.")
+
+    vix, multiplier = risk_controls.check_vix_regime(conn)
+    columns = st.columns(2)
+    columns[0].metric("VIX", f"{vix:.1f}" if vix is not None else "Unavailable")
+    columns[1].metric("Exposure multiplier", f"{multiplier:.1f}x")
+
+    watch = []
+    for row in positions:
+        current_price = current_prices.get(row["ticker"])
+        if current_price is None or row["entry_price"] <= 0:
+            continue
+        return_pct = current_price / float(row["entry_price"]) - 1.0
+        if -config.POSITION_STOP_LOSS_PCT < return_pct <= -config.POSITION_STOP_LOSS_PCT + 0.05:
+            watch.append({
+                "Ticker": row["ticker"],
+                "Entry date": row["entry_date"],
+                "Return": f"{return_pct:+.1%}",
+                "Current price": f"${current_price:.2f}",
+            })
+    st.markdown("**Stop-loss watch**")
+    st.dataframe(watch, use_container_width=True) if watch else st.caption("No positions near the stop-loss threshold.")
+
+    exits = conn.execute(
+        "SELECT date, notes FROM portfolio_history WHERE notes IS NOT NULL ORDER BY date DESC, id DESC LIMIT 10"
+    ).fetchall()
+    st.markdown("**Recent portfolio exits**")
+    st.dataframe(
+        [{"Date": row["date"], "Details": row["notes"]} for row in exits],
+        use_container_width=True,
+    ) if exits else st.caption("No recent portfolio exits recorded.")
+
+
 def main() -> None:
     st.title("📈 StockOracle")
     st.caption("Research tool — analysis and reasoning, not financial advice.")
@@ -396,6 +460,7 @@ def main() -> None:
 
         sma_data = _sma_regime_panel(conn, config.WATCHLIST)
         _portfolio_allocation_panel(conn, sma_data)
+        _risk_status_panel(conn)
         _data_health_panel(conn)
         _paper_portfolio_panel()
 

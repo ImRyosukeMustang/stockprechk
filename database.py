@@ -291,6 +291,28 @@ CREATE TABLE IF NOT EXISTS sma_signal_journal (
 
 CREATE INDEX IF NOT EXISTS idx_journal_ticker_date ON sma_signal_journal(ticker, date);
 CREATE INDEX IF NOT EXISTS idx_journal_date ON sma_signal_journal(date);
+
+CREATE TABLE IF NOT EXISTS portfolio_history (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    date TEXT NOT NULL UNIQUE,
+    total_value REAL NOT NULL,
+    cash REAL NOT NULL,
+    peak_value REAL NOT NULL,
+    n_positions INTEGER NOT NULL,
+    vix_at_close REAL,
+    notes TEXT,
+    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE TABLE IF NOT EXISTS open_positions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    ticker TEXT NOT NULL UNIQUE,
+    entry_date TEXT NOT NULL,
+    entry_price REAL NOT NULL,
+    shares REAL NOT NULL,
+    last_checked TEXT,
+    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
 """
  
  

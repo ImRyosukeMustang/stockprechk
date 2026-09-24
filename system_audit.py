@@ -74,7 +74,8 @@ def audit_schema(conn: sqlite3.Connection) -> None:
         "sentiment_scores", "technical_indicators", "predictions",
         "signals", "pipeline_runs", "backtest_results",
         "sma_signal_journal", "prices_intraday", "macro_indicators",
-        "patterns", "pattern_outcomes", "news_events",
+        "patterns", "pattern_outcomes", "news_events", "portfolio_history",
+        "open_positions",
     }
 
     actual_tables = {
