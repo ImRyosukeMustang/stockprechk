@@ -78,8 +78,16 @@ CREATE TABLE IF NOT EXISTS fundamentals (
     date        TEXT    NOT NULL,          -- date the snapshot was taken
     market_cap  REAL,
     pe_ratio    REAL,
+    forward_pe  REAL,
+    peg_ratio   REAL,
     eps         REAL,
+    profit_margin REAL,
+    revenue_growth REAL,
+    earnings_growth REAL,
+    debt_to_equity REAL,
+    free_cashflow REAL,
     dividend_yield REAL,
+    beta REAL,
     sector      TEXT,
     industry    TEXT,
     raw_json    TEXT,                      -- full yfinance .info blob, for anything not modeled above
@@ -139,6 +147,47 @@ CREATE TABLE IF NOT EXISTS signals (
 );
  
 CREATE INDEX IF NOT EXISTS idx_signals_ticker_date ON signals(ticker, date);
+
+CREATE TABLE IF NOT EXISTS patterns (
+    pattern_id TEXT PRIMARY KEY,
+    rsi_bucket TEXT NOT NULL,
+    macd_state TEXT NOT NULL,
+    bb_position TEXT NOT NULL,
+    trend TEXT NOT NULL,
+    volume TEXT NOT NULL,
+    description TEXT,
+    first_seen TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE TABLE IF NOT EXISTS pattern_outcomes (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    pattern_id TEXT NOT NULL,
+    ticker TEXT NOT NULL,
+    date TEXT NOT NULL,
+    forward_5d_return REAL,
+    forward_20d_return REAL,
+    was_up_5d INTEGER,
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    UNIQUE(pattern_id, ticker, date)
+);
+
+CREATE INDEX IF NOT EXISTS idx_pattern_outcomes_pattern ON pattern_outcomes(pattern_id);
+CREATE INDEX IF NOT EXISTS idx_pattern_outcomes_ticker_date ON pattern_outcomes(ticker, date);
+
+CREATE TABLE IF NOT EXISTS news_events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    ticker TEXT NOT NULL,
+    date TEXT NOT NULL,
+    headline TEXT NOT NULL,
+    url TEXT,
+    event_type TEXT,
+    sentiment REAL,
+    political INTEGER DEFAULT 0,
+    category TEXT,
+    summary TEXT,
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    UNIQUE(ticker, url)
+);
  
 CREATE TABLE IF NOT EXISTS pipeline_runs (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -168,6 +217,15 @@ CREATE TABLE IF NOT EXISTS backtest_results (
 );
  
 CREATE INDEX IF NOT EXISTS idx_backtest_ticker ON backtest_results(ticker);
+
+CREATE TABLE IF NOT EXISTS macro_indicators (
+    date TEXT PRIMARY KEY,
+    fed_funds_rate REAL,
+    ten_year_yield REAL,
+    cpi REAL,
+    vix REAL,
+    fetched_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
 
 CREATE TABLE IF NOT EXISTS prices_intraday (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -249,6 +307,15 @@ def init_db(db_path: Path | str | None = None) -> None:
         except sqlite3.OperationalError as exc:
             if "duplicate column name" not in str(exc).lower():
                 raise  # Re-raise real errors; ignore "already exists"
+        for column in (
+            "forward_pe", "peg_ratio", "profit_margin", "revenue_growth",
+            "earnings_growth", "debt_to_equity", "free_cashflow", "beta",
+        ):
+            try:
+                conn.execute(f"ALTER TABLE fundamentals ADD COLUMN {column} REAL")
+            except sqlite3.OperationalError as exc:
+                if "duplicate column name" not in str(exc).lower():
+                    raise
     log.info("Database initialized at %s", db_path or config.DB_PATH)
  
  
@@ -337,14 +404,26 @@ def insert_fundamentals(
     sector: str | None,
     industry: str | None,
     raw_json: str | None,
+    forward_pe: float | None = None,
+    peg_ratio: float | None = None,
+    profit_margin: float | None = None,
+    revenue_growth: float | None = None,
+    earnings_growth: float | None = None,
+    debt_to_equity: float | None = None,
+    free_cashflow: float | None = None,
+    beta: float | None = None,
 ) -> None:
     conn.execute(
         """
         INSERT OR IGNORE INTO fundamentals
-            (ticker, date, market_cap, pe_ratio, eps, dividend_yield, sector, industry, raw_json)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            (ticker, date, market_cap, pe_ratio, forward_pe, peg_ratio, eps,
+             profit_margin, revenue_growth, earnings_growth, debt_to_equity,
+             free_cashflow, dividend_yield, beta, sector, industry, raw_json)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
-        (ticker, date, market_cap, pe_ratio, eps, dividend_yield, sector, industry, raw_json),
+        (ticker, date, market_cap, pe_ratio, forward_pe, peg_ratio, eps,
+         profit_margin, revenue_growth, earnings_growth, debt_to_equity,
+         free_cashflow, dividend_yield, beta, sector, industry, raw_json),
     )
  
  
@@ -541,6 +620,41 @@ def update_signal_thesis(conn: sqlite3.Connection, signal_id: int, thesis: str) 
     original signal decision, so it's a separate write rather than requiring
     every signal-writer to know about theses."""
     conn.execute("UPDATE signals SET thesis = ? WHERE id = ?", (thesis, signal_id))
+
+
+def update_signal_reasoning(conn: sqlite3.Connection, signal_id: int, reasoning: str) -> None:
+    """Append enrichment such as pattern-memory reasoning to a signal row."""
+    conn.execute("UPDATE signals SET reasoning = ? WHERE id = ?", (reasoning, signal_id))
+
+
+def insert_news_event(
+    conn: sqlite3.Connection,
+    ticker: str,
+    date: str,
+    headline: str,
+    url: str | None,
+    event_type: str | None,
+    sentiment: float | None,
+    political: int,
+    category: str | None,
+    summary: str | None,
+) -> None:
+    conn.execute(
+        """
+        INSERT INTO news_events
+            (ticker, date, headline, url, event_type, sentiment, political, category, summary)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(ticker, url) DO UPDATE SET
+            date=excluded.date,
+            headline=excluded.headline,
+            event_type=excluded.event_type,
+            sentiment=excluded.sentiment,
+            political=excluded.political,
+            category=excluded.category,
+            summary=excluded.summary
+        """,
+        (ticker, date, headline, url, event_type, sentiment, political, category, summary),
+    )
  
  
 def insert_backtest_result(conn: sqlite3.Connection, result: dict[str, Any]) -> int:

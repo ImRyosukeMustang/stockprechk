@@ -69,16 +69,18 @@ LLM_MODEL_CHEAP: str = "gpt-4o-mini"   # sentiment tagging, quick classification
 LLM_MODEL_DEEP: str = "gpt-4o"         # full thesis writing, deep reasoning
 
 # ---------------------------------------------------------------------------
-# Watchlist — the universe of tickers the pipeline operates on. Day 0: a
-# small, deliberately boring starter list. Edit freely.
+# Watchlist — load the generated S&P 100 list when available, with a small
+# fallback so the project remains usable before the list is downloaded.
 # ---------------------------------------------------------------------------
-WATCHLIST: list[str] = [
-    "AAPL",
-    "MSFT",
-    "NVDA",
-    "GOOGL",
-    "AMZN",
-]
+_TICKERS_FILE = BASE_DIR / "top_100_tickers.txt"
+if _TICKERS_FILE.exists():
+    WATCHLIST: list[str] = [
+        line.strip().upper()
+        for line in _TICKERS_FILE.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+else:
+    WATCHLIST = ["AAPL", "MSFT", "NVDA", "GOOGL", "AMZN"]
 
 # ---------------------------------------------------------------------------
 # Risk / decision-engine settings (Phase 3 will consume these; defined now
@@ -106,6 +108,7 @@ MODELS_DIR: Path = BASE_DIR / "models"
 MODEL_NAME: str = "xgboost_v1"          # logical name stored alongside predictions
 MIN_TRAINING_SAMPLES: int = 60          # fewer rows than this and we refuse to train
 PREDICTION_HORIZON_DAYS: int = 1        # predict direction N trading days ahead
+FEATURE_SET: str = "optimal"            # "original" | "optimal" | "all"
 
 # ---------------------------------------------------------------------------
 # Backtester (Phase 3 — walk-forward validation, never a random split)

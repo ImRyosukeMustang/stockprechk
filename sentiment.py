@@ -32,7 +32,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import config
 import database
@@ -245,6 +245,74 @@ def analyze_ticker_sentiment(conn: sqlite3.Connection, ticker: str) -> dict[str,
         "reddit": analyze_reddit_sentiment(conn, ticker),
         "llm": analyze_llm_sentiment(conn, ticker),
     }
+
+
+def categorize_news_events(conn: sqlite3.Connection, ticker: str) -> int:
+    """Categorize uncategorized headlines from the last seven days with OpenAI."""
+    if not config.OPENAI_API_KEY:
+        log.warning("OPENAI_API_KEY not set — skipping news event categorization for %s.", ticker)
+        return 0
+    try:
+        from openai import OpenAI
+    except ImportError:
+        log.warning("openai package not installed — skipping news event categorization.")
+        return 0
+
+    cutoff = datetime.now(timezone.utc) - timedelta(days=7)
+    existing = {
+        row["url"]
+        for row in conn.execute("SELECT url FROM news_events WHERE ticker = ?", (ticker,)).fetchall()
+        if row["url"]
+    }
+    news_items = database.get_recent_news(conn, ticker, limit=100)
+    client = OpenAI(api_key=config.OPENAI_API_KEY)
+    categorized = 0
+    allowed_types = {"earnings", "analyst_rating", "M&A", "regulatory", "macro_fed", "product_launch", "legal", "geopolitical", "management_change", "other"}
+    for item in news_items:
+        url = item["url"] or f"news:{item['id']}"
+        if url in existing:
+            continue
+        raw_date = item["published_at"] or item["fetched_at"]
+        try:
+            item_date = datetime.fromisoformat(str(raw_date).replace("Z", "+00:00"))
+            if item_date.tzinfo is None:
+                item_date = item_date.replace(tzinfo=timezone.utc)
+        except (TypeError, ValueError):
+            continue
+        if item_date < cutoff:
+            continue
+        prompt = f"""Categorize this headline about {ticker}. Return JSON:
+{{
+  "event_type": one of ["earnings", "analyst_rating", "M&A", "regulatory", "macro_fed", "product_launch", "legal", "geopolitical", "management_change", "other"],
+  "political": 0 or 1,
+  "sentiment": -1.0 to 1.0,
+  "summary": "one-sentence explanation"
+}}
+
+Headline: {item['title']}"""
+        try:
+            response = client.chat.completions.create(
+                model=config.LLM_MODEL_CHEAP,
+                messages=[{"role": "user", "content": prompt}],
+                temperature=0.0,
+            )
+            raw = response.choices[0].message.content.strip()
+            raw = raw.removeprefix("```json").removeprefix("```").removesuffix("```").strip()
+            parsed = json.loads(raw)
+            event_type = parsed.get("event_type", "other")
+            if event_type not in allowed_types:
+                event_type = "other"
+            score = max(-1.0, min(1.0, float(parsed.get("sentiment", 0.0))))
+            database.insert_news_event(
+                conn, ticker, item_date.strftime("%Y-%m-%d"), item["title"], url,
+                event_type, score, int(bool(parsed.get("political", 0))), event_type,
+                str(parsed.get("summary", "")),
+            )
+            categorized += 1
+        except Exception as exc:
+            log.warning("Failed to categorize news for %s: %s", ticker, exc)
+    log.info("Categorized %d news events for %s", categorized, ticker)
+    return categorized
 
 
 def analyze_watchlist_sentiment(conn: sqlite3.Connection, tickers: list[str] | None = None) -> dict[str, dict[str, bool]]:

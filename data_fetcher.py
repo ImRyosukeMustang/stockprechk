@@ -23,6 +23,8 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import time
+from concurrent.futures import ThreadPoolExecutor, TimeoutError
 import urllib.parse
 from datetime import datetime, timedelta, timezone
 
@@ -30,6 +32,8 @@ import config
 import database
 
 log = config.get_logger(__name__)
+REQUEST_DELAY_SECONDS = 0.3
+YFINANCE_INFO_TIMEOUT_SECONDS = 30
 
 
 # ---------------------------------------------------------------------------
@@ -85,11 +89,22 @@ def fetch_fundamentals(conn: sqlite3.Connection, ticker: str) -> bool:
         log.warning("yfinance not installed — skipping fundamentals fetch for %s.", ticker)
         return False
 
+    executor = ThreadPoolExecutor(max_workers=1)
+    future = executor.submit(lambda: yf.Ticker(ticker).info)
     try:
-        info = yf.Ticker(ticker).info
+        info = future.result(timeout=YFINANCE_INFO_TIMEOUT_SECONDS)
+    except TimeoutError:
+        log.error(
+            "Timed out fetching fundamentals for %s after %ds",
+            ticker,
+            YFINANCE_INFO_TIMEOUT_SECONDS,
+        )
+        return False
     except Exception as exc:
         log.error("Failed to fetch fundamentals for %s: %s", ticker, exc)
         return False
+    finally:
+        executor.shutdown(wait=False, cancel_futures=True)
 
     if not info:
         log.warning("yfinance returned no fundamentals info for %s", ticker)
@@ -104,6 +119,14 @@ def fetch_fundamentals(conn: sqlite3.Connection, ticker: str) -> bool:
         pe_ratio=info.get("trailingPE"),
         eps=info.get("trailingEps"),
         dividend_yield=info.get("dividendYield"),
+        forward_pe=info.get("forwardPE"),
+        peg_ratio=info.get("pegRatio"),
+        profit_margin=info.get("profitMargins"),
+        revenue_growth=info.get("revenueGrowth"),
+        earnings_growth=info.get("earningsGrowth"),
+        debt_to_equity=info.get("debtToEquity"),
+        free_cashflow=info.get("freeCashflow"),
+        beta=info.get("beta"),
         sector=info.get("sector"),
         industry=info.get("industry"),
         raw_json=json.dumps(info, default=str),
@@ -270,9 +293,13 @@ def fetch_all_for_ticker(conn: sqlite3.Connection, ticker: str, company_name: st
     Each source is independently best-effort: one failing doesn't stop the others."""
     results: dict[str, int] = {}
     results["prices"] = fetch_prices(conn, ticker)
+    time.sleep(REQUEST_DELAY_SECONDS)
     results["fundamentals"] = int(fetch_fundamentals(conn, ticker))
+    time.sleep(REQUEST_DELAY_SECONDS)
     results["google_news"] = fetch_google_news(conn, ticker, company_name)
+    time.sleep(REQUEST_DELAY_SECONDS)
     results["newsapi"] = fetch_newsapi(conn, ticker, company_name)
+    time.sleep(REQUEST_DELAY_SECONDS)
     results["reddit"] = fetch_reddit_posts(conn, ticker)
     return results
 

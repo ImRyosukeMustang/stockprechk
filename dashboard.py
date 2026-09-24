@@ -20,6 +20,8 @@ import sys
 
 import config
 import database
+import alpaca_account
+import pattern_analysis
 import portfolio
 
 log = config.get_logger(__name__)
@@ -266,6 +268,66 @@ def _portfolio_allocation_panel(sma_data: dict[str, dict]) -> None:
     col3.metric("Positions", summary["n_positions"])
 
 
+def _pattern_memory_panel(conn, ticker: str) -> None:
+    """Show the current categorical pattern, outcomes, and active events."""
+    result = pattern_analysis.compute_probability(conn, ticker)
+    st.subheader("Pattern Memory")
+    if not result["pattern"]:
+        st.info("No pattern history is available for this ticker.")
+        return
+
+    pattern = result["pattern"]
+    stats = result["pattern_stats"]
+    left, right = st.columns(2)
+    with left:
+        st.write(", ".join(f"{key}: {value}" for key, value in pattern.items() if key != "date"))
+        st.metric("Probability up", f"{result['probability_up']:.0%}")
+        st.metric("Confidence", f"{result['confidence']:.0%}")
+    with right:
+        st.write(
+            f"This pattern has appeared {stats['count']} times on {ticker}. "
+            f"Hit rate: {stats['win_rate']:.0%}."
+        )
+        st.write(f"Average 5-day return: {stats['avg_5d']:+.2f}%")
+        st.write(f"Average 20-day return: {stats['avg_20d']:+.2f}%")
+    st.write(result["reasoning"])
+    if result["news_events"]:
+        st.dataframe(
+            [
+                {
+                    "Date": event["date"],
+                    "Headline": event["headline"],
+                    "Event": event["event_type"] or "other",
+                    "Sentiment": event["sentiment"],
+                    "Summary": event["summary"] or "",
+                }
+                for event in result["news_events"]
+            ],
+            use_container_width=True,
+        )
+    else:
+        st.caption("No categorized news events in the last 7 days.")
+
+
+def _paper_portfolio_panel() -> None:
+    """Show read-only Alpaca paper-account state when credentials are available."""
+    st.subheader("Paper Portfolio")
+    account = alpaca_account.get_paper_account()
+    if account is None:
+        st.info("Alpaca paper-account data is unavailable.")
+        return
+    columns = st.columns(4)
+    columns[0].metric("Equity", f"${account['equity']:,.2f}")
+    columns[1].metric("Cash", f"${account['cash']:,.2f}")
+    columns[2].metric("Buying power", f"${account['buying_power']:,.2f}")
+    columns[3].metric("Status", account["status"])
+    positions = alpaca_account.get_current_positions()
+    if positions:
+        st.dataframe(positions, use_container_width=True)
+    else:
+        st.caption("No open paper positions.")
+
+
 def main() -> None:
     st.title("📈 StockOracle")
     st.caption("Research tool — analysis and reasoning, not financial advice.")
@@ -283,6 +345,7 @@ def main() -> None:
 
         sma_data = _sma_regime_panel(conn, config.WATCHLIST)
         _portfolio_allocation_panel(sma_data)
+        _paper_portfolio_panel()
 
         if st.sidebar.button("Run pipeline now", help="Fetch fresh data and regenerate signals for this ticker."):
             with st.spinner(f"Running pipeline for {ticker}..."):
@@ -296,6 +359,7 @@ def main() -> None:
 
         st.header(f"{ticker}")
         _signal_panel(conn, ticker)
+        _pattern_memory_panel(conn, ticker)
 
         st.subheader("Price & Technicals")
         _price_chart(conn, ticker)

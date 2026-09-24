@@ -172,10 +172,12 @@ def _technical_component_from_row(row) -> tuple[float, str] | None:
  
  
 def _is_nan(x) -> bool:
+    if x is None:
+        return True
     try:
-        return x != x  # NaN != NaN
+        return bool(x != x)  # NaN != NaN
     except Exception:
-        return False
+        return True
  
  
 def run_walkforward_backtest(
@@ -184,6 +186,7 @@ def run_walkforward_backtest(
     horizon_days: int = predictor.DEFAULT_HORIZON_DAYS,
     min_train_rows: int = predictor.MIN_TRAINING_ROWS,
     fold_size: int = DEFAULT_FOLD_SIZE,
+    feature_columns: list[str] | None = None,
 ) -> dict | None:
     """
     Run a full walk-forward backtest for `ticker`. Returns a metrics dict
@@ -191,6 +194,7 @@ def run_walkforward_backtest(
     data or a required dependency is missing.
     """
     backend_name, factory = predictor._get_model_backend()
+    feature_columns = list(feature_columns or predictor.FEATURE_COLUMNS)
     if factory is None:
         log.warning("No ML backend (xgboost or scikit-learn) available — cannot backtest %s.", ticker)
         return None
@@ -212,6 +216,8 @@ def run_walkforward_backtest(
  
     # Collect an out-of-sample (signal, row) for every date covered by a fold.
     oos_predictions: dict[int, float] = {}  # row index -> probability_up
+    feature_importance_totals = {column: 0.0 for column in feature_columns}
+    feature_importance_folds = 0
     n_predictions_saved = 0
     for fold_id, (train_end, test_start, test_end) in enumerate(folds):
         train_slice = df.iloc[:train_end]
@@ -220,14 +226,19 @@ def run_walkforward_backtest(
             log.warning("%s: fold train slice [0:%d) has a single class — skipping fold.", ticker, train_end)
             continue
  
-        X_train = train_slice[predictor.FEATURE_COLUMNS]
+        X_train = predictor._sanitize_features(train_slice[feature_columns], expected_columns=feature_columns)
         y_train = train_slice["label"].astype(int)
  
         model = factory()
         model.fit(X_train, y_train)
+        importances = getattr(model, "feature_importances_", None)
+        if importances is not None and len(importances) == len(feature_columns):
+            for column, importance in zip(feature_columns, importances):
+                feature_importance_totals[column] += float(importance)
+            feature_importance_folds += 1
  
         test_slice = df.iloc[test_start:test_end]
-        X_test = test_slice[predictor.FEATURE_COLUMNS]
+        X_test = predictor._sanitize_features(test_slice[feature_columns], expected_columns=feature_columns)
         probs = model.predict_proba(X_test)[:, 1]
         for idx, prob in zip(test_slice.index, probs):
             oos_predictions[idx] = float(prob)
@@ -265,6 +276,31 @@ def run_walkforward_backtest(
  
     trades, equity_curve = _simulate_trades(df, oos_predictions)
     metrics = _compute_metrics(df, oos_predictions, trades, equity_curve)
+    if feature_importance_folds:
+        metrics["feature_importances"] = {
+            column: value / feature_importance_folds
+            for column, value in feature_importance_totals.items()
+        }
+        log.info(
+            "%s feature importance: %s",
+            ticker,
+            ", ".join(
+                f"{column}={importance:.4f}"
+                for column, importance in sorted(
+                    metrics["feature_importances"].items(), key=lambda item: item[1], reverse=True
+                )[:10]
+            ),
+        )
+    else:
+        metrics["feature_importances"] = {}
+    labeled_oos = [idx for idx in oos_predictions if df.iloc[idx]["label"] is not None and not _is_nan(df.iloc[idx]["label"])]
+    if labeled_oos:
+        metrics["holdout_accuracy"] = sum(
+            int((oos_predictions[idx] >= 0.5) == bool(df.iloc[idx]["label"]))
+            for idx in labeled_oos
+        ) / len(labeled_oos)
+    else:
+        metrics["holdout_accuracy"] = None
     metrics.update(
         {
             "ticker": ticker,
@@ -273,6 +309,7 @@ def run_walkforward_backtest(
             "n_folds": len(folds),
             "n_oos_days": len(oos_predictions),
             "run_at": datetime.now(timezone.utc).isoformat(),
+            "feature_columns": feature_columns,
         }
     )
  

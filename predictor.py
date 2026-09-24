@@ -52,7 +52,7 @@ log = config.get_logger(__name__)
 MODELS_DIR = Path(__file__).resolve().parent / "models"
 DEFAULT_HORIZON_DAYS = 5
 MIN_TRAINING_ROWS = 60  # below this, a walk-forward split is meaningless
-FEATURE_COLUMNS = [
+TECHNICAL_FEATURE_COLUMNS = [
     "rsi_14",
     "macd",
     "macd_signal",
@@ -62,10 +62,49 @@ FEATURE_COLUMNS = [
     "close_to_sma200",
     "daily_return",
     "volume_change",
+]
+RAW_SENTIMENT_FEATURE_COLUMNS = [
     "sentiment_news",
     "sentiment_reddit",
     "sentiment_llm",
 ]
+FUNDAMENTAL_FEATURE_COLUMNS = [
+    "pe_ratio",
+    "forward_pe",
+    "peg_ratio",
+    "profit_margin",
+    "revenue_growth",
+    "earnings_growth",
+    "debt_to_equity",
+    "free_cashflow",
+    "dividend_yield",
+    "beta",
+]
+SENTIMENT_AGGREGATE_FEATURE_COLUMNS = [
+    "news_sentiment_avg_5d",
+    "news_count_5d",
+    "sentiment_trend_5d",
+]
+MACRO_FEATURE_COLUMNS = ["fed_funds_rate", "ten_year_yield", "cpi", "vix"]
+
+_FEATURE_SET_COLUMNS = {
+    "original": TECHNICAL_FEATURE_COLUMNS,
+    "optimal": TECHNICAL_FEATURE_COLUMNS + FUNDAMENTAL_FEATURE_COLUMNS + SENTIMENT_AGGREGATE_FEATURE_COLUMNS,
+    "all": (
+        TECHNICAL_FEATURE_COLUMNS
+        + RAW_SENTIMENT_FEATURE_COLUMNS
+        + FUNDAMENTAL_FEATURE_COLUMNS
+        + SENTIMENT_AGGREGATE_FEATURE_COLUMNS
+        + MACRO_FEATURE_COLUMNS
+    ),
+}
+if config.FEATURE_SET not in _FEATURE_SET_COLUMNS:
+    raise ValueError(
+        f"Unsupported config.FEATURE_SET={config.FEATURE_SET!r}; "
+        f"choose one of {', '.join(_FEATURE_SET_COLUMNS)}"
+    )
+FEATURE_COLUMNS = _FEATURE_SET_COLUMNS[config.FEATURE_SET]
+ORIGINAL_FEATURE_COLUMNS = _FEATURE_SET_COLUMNS["original"]
 # ---------------------------------------------------------------------------
 # Dtype hygiene
 # ---------------------------------------------------------------------------
@@ -148,6 +187,54 @@ def build_feature_frame(conn: sqlite3.Connection, ticker: str):
         pivot = sent_df.pivot_table(index="date", columns="source_type", values="score", aggfunc="mean")
         pivot = pivot.rename(columns={"news": "sentiment_news", "reddit": "sentiment_reddit", "llm": "sentiment_llm"})
         df = df.merge(pivot, on="date", how="left")
+        news = sent_df[sent_df["source_type"] == "news"][["date", "score"]].copy()
+        if not news.empty:
+            def aggregate_news(row):
+                window = news[(news["date"] >= row["date"] - pd.Timedelta(days=4)) & (news["date"] <= row["date"])]
+                if window.empty:
+                    return pd.Series({
+                        "news_sentiment_avg_5d": float("nan"),
+                        "news_count_5d": float("nan"),
+                        "sentiment_trend_5d": float("nan"),
+                    })
+                x = (window["date"] - window["date"].min()).dt.days.astype(float)
+                slope = 0.0 if len(window) < 2 or x.nunique() < 2 else float(
+                    ((x - x.mean()) * (window["score"] - window["score"].mean())).sum()
+                    / ((x - x.mean()) ** 2).sum()
+                )
+                return pd.Series({
+                    "news_sentiment_avg_5d": window["score"].mean(),
+                    "news_count_5d": float(len(window)),
+                    "sentiment_trend_5d": slope,
+                })
+
+            aggregates = df[["date"]].apply(aggregate_news, axis=1)
+            df = pd.concat([df, aggregates], axis=1)
+    # Fundamentals are dated snapshots. Forward-fill only from a snapshot at
+    # or before the price date; never backfill current information into history.
+    fundamental_rows = conn.execute(
+        """SELECT date, pe_ratio, forward_pe, peg_ratio, profit_margin,
+                  revenue_growth, earnings_growth, debt_to_equity,
+                  free_cashflow, dividend_yield, beta
+           FROM fundamentals WHERE ticker = ? ORDER BY date ASC""",
+        (ticker,),
+    ).fetchall()
+    if fundamental_rows:
+        fundamentals = pd.DataFrame([dict(row) for row in fundamental_rows])
+        fundamentals["date"] = pd.to_datetime(fundamentals["date"])
+        fundamentals = fundamentals.drop_duplicates("date").sort_values("date")
+        df = df.merge(fundamentals, on="date", how="left")
+        df[FUNDAMENTAL_FEATURE_COLUMNS] = df[FUNDAMENTAL_FEATURE_COLUMNS].ffill()
+    # Macro observations have different publication frequencies. Joining by
+    # date then forward-filling carries the latest known observation forward.
+    macro_rows = conn.execute(
+        "SELECT date, fed_funds_rate, ten_year_yield, cpi, vix FROM macro_indicators ORDER BY date ASC"
+    ).fetchall()
+    if macro_rows:
+        macro = pd.DataFrame([dict(row) for row in macro_rows])
+        macro["date"] = pd.to_datetime(macro["date"])
+        df = df.merge(macro, on="date", how="left")
+        df[MACRO_FEATURE_COLUMNS] = df[MACRO_FEATURE_COLUMNS].ffill()
     # Force sentiment columns to exist and be float64 — never let them become
     # pure-object, which would cause _sanitize_features to drop them.
     for col in ("sentiment_news", "sentiment_reddit", "sentiment_llm"):
@@ -159,9 +246,12 @@ def build_feature_frame(conn: sqlite3.Connection, ticker: str):
     for col in (
         "rsi_14", "macd", "macd_signal", "macd_hist", "bb_percent",
         "close_to_sma50", "close_to_sma200", "daily_return", "volume_change",
+        *FUNDAMENTAL_FEATURE_COLUMNS, *SENTIMENT_AGGREGATE_FEATURE_COLUMNS,
+        *MACRO_FEATURE_COLUMNS,
     ):
-        if col in df.columns:
-            df[col] = pd.to_numeric(df[col], errors="coerce").astype("float64")
+        if col not in df.columns:
+            df[col] = float("nan")
+        df[col] = pd.to_numeric(df[col], errors="coerce").astype("float64")
     return df
 # ---------------------------------------------------------------------------
 # Backend selection

@@ -17,14 +17,18 @@ Usage:
 from __future__ import annotations
 
 import sys
+from datetime import date, timedelta
 
 import config
 import data_fetcher
 import database
 import decision_engine
 import journal
+import macro_fetcher
 import predictor
 import portfolio
+import pattern_analysis
+import pattern_detector
 import sentiment
 import technical
 
@@ -66,35 +70,50 @@ def run_pipeline(tickers: list[str] | None = None) -> dict[str, dict[str, int]]:
         )
 
         try:
-            for ticker in tickers:
-                company_name = COMPANY_NAMES.get(ticker.upper())
-                log.info("--- %s ---", ticker)
-                fetch_counts = data_fetcher.fetch_all_for_ticker(conn, ticker, company_name)
+            macro_fetcher.fetch_all_macro(conn, date.today() - timedelta(days=365 * 5))
+            for index, ticker in enumerate(tickers, start=1):
+                try:
+                    company_name = COMPANY_NAMES.get(ticker.upper())
+                    log.info("--- %s (%d/%d) ---", ticker, index, len(tickers))
+                    fetch_counts = data_fetcher.fetch_all_for_ticker(conn, ticker, company_name)
 
-                # Phase 2: turn what we just fetched (plus prior history) into signals.
-                sentiment_results = sentiment.analyze_ticker_sentiment(conn, ticker)
-                technical_count = technical.compute_indicators_for_ticker(conn, ticker)
+                    # Phase 2: turn what we just fetched (plus prior history) into signals.
+                    sentiment_results = sentiment.analyze_ticker_sentiment(conn, ticker)
+                    sentiment.categorize_news_events(conn, ticker)
+                    technical_count = technical.compute_indicators_for_ticker(conn, ticker)
+                    pattern_detector.detect_and_store(conn, ticker)
 
-                # Phase 3: retrain/refresh the predictor and combine everything
-                # into a BUY/SELL/HOLD call via decision_engine. Either can
-                # legitimately have nothing to do yet (not enough history to
-                # train, or no trained model to predict from) — both degrade
-                # to None/HOLD rather than raising, same as every earlier step.
-                train_summary = predictor.train_model(conn, ticker)
-                probability_up = predictor.predict_latest(conn, ticker) if train_summary else None
-                decision = decision_engine.generate_signal(conn, ticker)
+                    # Phase 3: retrain/refresh the predictor and combine everything
+                    # into a BUY/SELL/HOLD call via decision_engine.
+                    train_summary = predictor.train_model(conn, ticker)
+                    probability_up = predictor.predict_latest(conn, ticker) if train_summary else None
+                    decision = decision_engine.generate_signal(conn, ticker)
+                    pattern = pattern_analysis.compute_probability(conn, ticker)
+                    if decision.get("signal_id"):
+                        enriched_reasoning = (
+                            f"{decision['reasoning']} | Pattern memory: {pattern['reasoning']} "
+                            f"Probability up={pattern['probability_up']:.0%}, confidence={pattern['confidence']:.0%}."
+                        )
+                        database.update_signal_reasoning(conn, decision["signal_id"], enriched_reasoning)
 
-                summary[ticker] = {
-                    **fetch_counts,
-                    "sentiment_news": int(sentiment_results["news"]),
-                    "sentiment_reddit": int(sentiment_results["reddit"]),
-                    "sentiment_llm": int(sentiment_results["llm"]),
-                    "technical_dates": technical_count,
-                    "trained": bool(train_summary),
-                    "probability_up": probability_up,
-                    "signal": decision["signal"],
-                    "confidence": decision["confidence"],
-                }
+                    summary[ticker] = {
+                        **fetch_counts,
+                        "sentiment_news": int(sentiment_results["news"]),
+                        "sentiment_reddit": int(sentiment_results["reddit"]),
+                        "sentiment_llm": int(sentiment_results["llm"]),
+                        "technical_dates": technical_count,
+                        "trained": bool(train_summary),
+                        "probability_up": probability_up,
+                        "signal": decision["signal"],
+                        "confidence": decision["confidence"],
+                        "pattern_probability_up": pattern["probability_up"],
+                        "pattern_confidence": pattern["confidence"],
+                    }
+                except Exception as exc:
+                    log.error("Ticker %s failed; continuing: %s", ticker, exc)
+                if index % 10 == 0 or index == len(tickers):
+                    log.info("Progress: %d/%d tickers complete", index, len(tickers))
+                conn.commit()
         except Exception as exc:
             database.finish_pipeline_run(conn, run_id, status="failed", detail=str(exc))
             log.error("Pipeline run #%d failed: %s", run_id, exc)
@@ -123,24 +142,39 @@ def run_pipeline_sma_only(tickers: list[str] | None = None) -> dict:
     with database.get_connection() as conn:
         journal.backfill_forward_returns(conn)
         log.info("Starting SMA-only pipeline for %d tickers", len(tickers))
-        for ticker in tickers:
-            company_name = COMPANY_NAMES.get(ticker.upper())
-            log.info("--- %s ---", ticker)
-            data_fetcher.fetch_all_for_ticker(conn, ticker, company_name)
-            technical.compute_indicators_for_ticker(conn, ticker)
-            signals[ticker] = decision_engine.generate_sma_only_signal(conn, ticker)
-            latest_prices = database.get_price_history(conn, ticker, limit=1)
-            close_price = float(latest_prices[0]["close"]) if latest_prices else None
-            signal = signals[ticker]
-            journal.log_signal(
-                conn,
-                ticker,
-                signal["regime"],
-                signal["sma50"],
-                signal["sma200"],
-                close_price,
-                "BUY" if signal["regime"] == "bullish" else "SELL",
-            )
+        for index, ticker in enumerate(tickers, start=1):
+            try:
+                company_name = COMPANY_NAMES.get(ticker.upper())
+                log.info("--- %s (%d/%d) ---", ticker, index, len(tickers))
+                data_fetcher.fetch_all_for_ticker(conn, ticker, company_name)
+                technical.compute_indicators_for_ticker(conn, ticker)
+                signals[ticker] = decision_engine.generate_sma_only_signal(conn, ticker)
+                pattern_detector.detect_and_store(conn, ticker)
+                pattern = pattern_analysis.compute_probability(conn, ticker)
+                latest_prices = database.get_price_history(conn, ticker, limit=1)
+                close_price = float(latest_prices[0]["close"]) if latest_prices else None
+                signal = signals[ticker]
+                journal.log_signal(
+                    conn,
+                    ticker,
+                    signal["regime"],
+                    signal["sma50"],
+                    signal["sma200"],
+                    close_price,
+                    "BUY" if signal["regime"] == "bullish" else "SELL",
+                )
+                if signal.get("signal_id"):
+                    database.update_signal_reasoning(
+                        conn,
+                        signal["signal_id"],
+                        f"{signal.get('reasoning', '')} | Pattern memory: {pattern['reasoning']} "
+                        f"Probability up={pattern['probability_up']:.0%}, confidence={pattern['confidence']:.0%}.",
+                    )
+            except Exception as exc:
+                log.error("Ticker %s failed; continuing: %s", ticker, exc)
+            if index % 10 == 0 or index == len(tickers):
+                log.info("SMA-only progress: %d/%d tickers complete", index, len(tickers))
+            conn.commit()
 
         allocation = portfolio.compute_portfolio_allocation(signals)
         portfolio_summary = portfolio.compute_portfolio_summary(allocation)

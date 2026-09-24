@@ -1,17 +1,66 @@
 {
-  "n_trades": 19,
-  "win_rate": 0.5263157894736842,
-  "avg_trade_return_pct": 2.0724507454948418,
-  "total_return_pct": 34.10061462633538,
+  "n_trades": 18,
+  "win_rate": 0.5,
+  "avg_trade_return_pct": 2.283886651777701,
+  "total_return_pct": 36.95688962018764,
   "buy_hold_return_pct": 45.76324719732017,
-  "max_drawdown_pct": -0.3217093112659082,
-  "sharpe_ratio": 0.38902929499508676,
+  "max_drawdown_pct": -0.33188863955714737,
+  "sharpe_ratio": 0.41196437678230186,
+  "feature_importances": {
+    "rsi_14": 0.11633960865437984,
+    "macd": 0.13077432960271834,
+    "macd_signal": 0.12050255052745343,
+    "macd_hist": 0.11435521245002747,
+    "bb_percent": 0.10341943167150021,
+    "close_to_sma50": 0.12132554538547993,
+    "close_to_sma200": 0.11282610483467578,
+    "daily_return": 0.08775351755321026,
+    "volume_change": 0.0927036851644516,
+    "pe_ratio": 0.0,
+    "forward_pe": 0.0,
+    "peg_ratio": 0.0,
+    "profit_margin": 0.0,
+    "revenue_growth": 0.0,
+    "earnings_growth": 0.0,
+    "debt_to_equity": 0.0,
+    "free_cashflow": 0.0,
+    "dividend_yield": 0.0,
+    "beta": 0.0,
+    "news_sentiment_avg_5d": 0.0,
+    "news_count_5d": 0.0,
+    "sentiment_trend_5d": 0.0
+  },
+  "holdout_accuracy": 0.5289672544080605,
   "ticker": "AMZN",
   "horizon_days": 5,
   "backend": "xgboost",
   "n_folds": 20,
   "n_oos_days": 1191,
-  "run_at": "2026-09-23T18:06:36.085447+00:00",
+  "run_at": "2026-09-24T08:33:24.201663+00:00",
+  "feature_columns": [
+    "rsi_14",
+    "macd",
+    "macd_signal",
+    "macd_hist",
+    "bb_percent",
+    "close_to_sma50",
+    "close_to_sma200",
+    "daily_return",
+    "volume_change",
+    "pe_ratio",
+    "forward_pe",
+    "peg_ratio",
+    "profit_margin",
+    "revenue_growth",
+    "earnings_growth",
+    "debt_to_equity",
+    "free_cashflow",
+    "dividend_yield",
+    "beta",
+    "news_sentiment_avg_5d",
+    "news_count_5d",
+    "sentiment_trend_5d"
+  ],
   "trades": [
     {
       "entry_date": "2022-03-22",
@@ -30,19 +79,11 @@
       "exit_reason": "take_profit"
     },
     {
-      "entry_date": "2022-06-10",
-      "exit_date": "2022-06-13",
-      "entry_price": 113.53341816711425,
-      "exit_price": 104.34629396903136,
-      "return_pct": -8.091999999999999,
-      "exit_reason": "stop_loss"
-    },
-    {
-      "entry_date": "2022-06-29",
-      "exit_date": "2022-07-21",
-      "entry_price": 107.48737725067137,
-      "exit_price": 123.4868733544338,
-      "return_pct": 14.884999999999993,
+      "entry_date": "2022-06-14",
+      "exit_date": "2022-07-20",
+      "entry_price": 104.29419244384765,
+      "exit_price": 119.81838298911435,
+      "return_pct": 14.884999999999984,
       "exit_reason": "take_profit"
     },
     {
@@ -87,18 +128,18 @@
     },
     {
       "entry_date": "2023-04-04",
-      "exit_date": "2023-05-02",
+      "exit_date": "2023-04-12",
       "entry_price": 102.85274999999999,
-      "exit_price": 103.63625786590576,
-      "return_pct": 0.761776292715339,
+      "exit_price": 98.85104695129395,
+      "return_pct": -3.890710796460021,
       "exit_reason": "sell_signal"
     },
     {
       "entry_date": "2023-05-15",
-      "exit_date": "2023-05-18",
+      "exit_date": "2023-05-24",
       "entry_price": 111.26115152740478,
-      "exit_price": 118.04184365844726,
-      "return_pct": 6.0943932702083625,
+      "exit_price": 116.51336725616456,
+      "return_pct": 4.720619602311149,
       "exit_reason": "sell_signal"
     },
     {
@@ -126,11 +167,11 @@
       "exit_reason": "take_profit"
     },
     {
-      "entry_date": "2023-12-29",
+      "entry_date": "2023-12-27",
       "exit_date": "2024-02-02",
-      "entry_price": 153.25310610961913,
+      "entry_price": 153.71355755615232,
       "exit_price": 170.02979695129395,
-      "return_pct": 10.94704783971867,
+      "return_pct": 10.614704164387854,
       "exit_reason": "sell_signal"
     },
     {
@@ -150,19 +191,19 @@
       "exit_reason": "take_profit"
     },
     {
-      "entry_date": "2025-08-28",
+      "entry_date": "2025-08-27",
       "exit_date": "2026-02-06",
-      "entry_price": 229.23900450134275,
-      "exit_price": 210.6889842570941,
-      "return_pct": -8.092,
+      "entry_price": 228.79857733154293,
+      "exit_price": 210.2841964538745,
+      "return_pct": -8.09199999999999,
       "exit_reason": "stop_loss"
     },
     {
-      "entry_date": "2026-07-17",
-      "exit_date": "2026-08-03",
-      "entry_price": 244.70446672058102,
-      "exit_price": 281.1287265919395,
-      "return_pct": 14.88499999999999,
+      "entry_date": "2026-07-23",
+      "exit_date": "2026-07-31",
+      "entry_price": 236.49625450134275,
+      "exit_price": 271.69872198386764,
+      "return_pct": 14.885000000000012,
       "exit_reason": "take_profit"
     }
   ]
