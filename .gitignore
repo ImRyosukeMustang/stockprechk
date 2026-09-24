@@ -1,3 +1,6 @@
 .env
 alpaca_keys.py
 finnhub_keys.py
+*.db
+*.db-journal
+*.db.backup
