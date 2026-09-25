@@ -7,8 +7,8 @@ praw
 python-dotenv
 
 # --- Phase 2 (sentiment + technical) ---
-transformers
-torch
+# transformers
+# torch
 ta
 
 # --- Phase 3 (the brain) ---
