@@ -1,6 +1,8 @@
-# 🎈 Blank app template
+# StockOracle
 
-A simple Streamlit app template for you to modify!
+StockOracle is a Streamlit dashboard for stock research, signals, and portfolio
+monitoring. The dashboard is read-only with respect to brokerage accounts; it
+does not place trades.
 
 ## Finnhub GitHub Secret
 
@@ -23,24 +25,15 @@ top 50 trend-strength tickers.
 
 To inspect fetch freshness locally, run `python print_data_health.py`.
 
-[![Open in Streamlit](https://static.streamlit.io/badges/streamlit_badge_black_white.svg)](https://blank-app-template.streamlit.app/)
+## Run locally
 
-### How to run it on your own machine
+Install the dependencies listed in `requirements.txt`, then launch Streamlit:
 
-Prerequisite: install `uv` if you don't already have it.
-
+```sh
+python -m pip install -r requirements.txt
+python -m streamlit run streamlit_app.py
 ```
-$ curl -LsSf https://astral.sh/uv/install.sh | sh
-```
 
-1. Sync the dependencies
-
-   ```
-   $ uv sync
-   ```
-
-2. Run the app
-
-   ```
-   $ uv run streamlit run streamlit_app.py
-   ```
+The `streamlit_app.py` entry point delegates to `dashboard.py`. API credentials
+are optional; configure them in the environment or a local `.env` file. Never
+commit API keys.
