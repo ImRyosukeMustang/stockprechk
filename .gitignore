@@ -21,3 +21,5 @@ backtests/
 alpaca_keys.py
 finnhub_keys.py
 gemini_keys.py
+__pycache__/
+*.pyc
