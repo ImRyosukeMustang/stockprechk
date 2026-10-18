@@ -45,9 +45,13 @@ except ImportError:
     st.error("Plotly is not installed. Run `pip install plotly` and restart the dashboard.")
     st.stop()
 
+# Optional: backtester may be heavy / slow on Streamlit Cloud; degrade gracefully.
+try:
+    import backtester
+except ImportError:
+    backtester = None
 
 st.set_page_config(page_title="StockOracle", layout="wide")
-
 database.init_db()
 
 
@@ -75,7 +79,6 @@ def _price_chart(conn, ticker: str):
         vertical_spacing=0.03,
         subplot_titles=("Price + Bollinger Bands + SMAs", "RSI(14)", "MACD"),
     )
-
     fig.add_trace(go.Scatter(x=dates, y=closes, name="Close", line=dict(color="#1f77b4")), row=1, col=1)
 
     bb_upper = [r["bb_upper"] for r in rows]
@@ -217,7 +220,6 @@ def _latest_sma_data(conn, tickers: list[str]) -> dict[str, dict]:
                 "position_size": 0.0,
             }
             continue
-
         sma50 = row["sma_50"]
         sma200 = row["sma_200"]
         regime = "unknown" if sma50 is None or sma200 is None else "bullish" if sma50 > sma200 else "bearish"
@@ -255,6 +257,7 @@ def _portfolio_allocation_panel(conn, sma_data: dict[str, dict]) -> None:
     """Show equal-weight SMA-only allocation and cash remainder."""
     allocation = portfolio.compute_portfolio_allocation(conn, sma_data)
     summary = portfolio.compute_portfolio_summary(allocation)
+
     st.subheader("Portfolio Allocation")
     st.dataframe(
         [
@@ -279,6 +282,7 @@ def _pattern_memory_panel(conn, ticker: str) -> None:
 
     pattern = result["pattern"]
     stats = result["pattern_stats"]
+
     left, right = st.columns(2)
     with left:
         st.write(", ".join(f"{key}: {value}" for key, value in pattern.items() if key != "date"))
@@ -291,7 +295,9 @@ def _pattern_memory_panel(conn, ticker: str) -> None:
         )
         st.write(f"Average 5-day return: {stats['avg_5d']:+.2f}%")
         st.write(f"Average 20-day return: {stats['avg_20d']:+.2f}%")
+
     st.write(result["reasoning"])
+
     if result["news_events"]:
         st.dataframe(
             [
@@ -317,11 +323,13 @@ def _paper_portfolio_panel() -> None:
     if account is None:
         st.info("Alpaca paper-account data is unavailable.")
         return
+
     columns = st.columns(4)
     columns[0].metric("Equity", f"${account['equity']:,.2f}")
     columns[1].metric("Cash", f"${account['cash']:,.2f}")
     columns[2].metric("Buying power", f"${account['buying_power']:,.2f}")
     columns[3].metric("Status", account["status"])
+
     positions = alpaca_account.get_current_positions()
     if positions:
         st.dataframe(positions, use_container_width=True)
@@ -350,10 +358,12 @@ def _data_health_panel(conn) -> None:
         """
     ).fetchone()[0]
     stale = total - fresh_three_days
+
     columns = st.columns(3)
     columns[0].metric("Tracked tickers", total)
     columns[1].metric("Fresh < 24h", fresh)
     columns[2].metric("Stale > 3d", stale)
+
     failures = conn.execute(
         """
         SELECT ticker, consecutive_failures, last_error, updated_at
@@ -471,6 +481,17 @@ def main() -> None:
                 pipeline_main.run_pipeline([ticker])
             st.sidebar.success("Pipeline run complete — refresh below to see updates.")
 
+        if st.sidebar.button("Run backtest", help="Run walk-forward backtest for the selected ticker."):
+            if backtester is None:
+                st.sidebar.error("backtester module is not available (import failed).")
+            else:
+                with st.spinner(f"Running backtest for {ticker} (this may take 2-5 minutes)..."):
+                    try:
+                        backtester.run_walkforward_backtest(conn, ticker)
+                        st.sidebar.success(f"Backtest complete for {ticker} — refresh to see results.")
+                    except Exception as exc:
+                        st.sidebar.error(f"Backtest failed: {exc}")
+
         st.sidebar.divider()
         st.sidebar.caption("Strategy: SMA 50/200")
         st.sidebar.caption("Portfolio: Equal weight, 20% cap")
@@ -491,4 +512,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
