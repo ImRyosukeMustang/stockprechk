@@ -11,13 +11,13 @@ log = config.get_logger(__name__)
 try:
     from alpaca_keys import ALPACA_API_KEY, ALPACA_SECRET_KEY
 except ImportError:
-    ALPACA_API_KEY = os.environ.get("ALPACA_API_KEY")
-    ALPACA_SECRET_KEY = os.environ.get("ALPACA_SECRET_KEY")
-
-if ALPACA_API_KEY:
-    ALPACA_API_KEY = ALPACA_API_KEY.strip()
-if ALPACA_SECRET_KEY:
-    ALPACA_SECRET_KEY = ALPACA_SECRET_KEY.strip()
+    try:
+        import streamlit as st
+        ALPACA_API_KEY = st.secrets.get("ALPACA_API_KEY", os.environ.get("ALPACA_API_KEY"))
+        ALPACA_SECRET_KEY = st.secrets.get("ALPACA_SECRET_KEY", os.environ.get("ALPACA_SECRET_KEY"))
+    except Exception:
+        ALPACA_API_KEY = os.environ.get("ALPACA_API_KEY")
+        ALPACA_SECRET_KEY = os.environ.get("ALPACA_SECRET_KEY")
 
 
 def _client():
