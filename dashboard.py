@@ -437,10 +437,11 @@ def _risk_status_panel(conn) -> None:
         "SELECT date, notes FROM portfolio_history WHERE notes IS NOT NULL ORDER BY date DESC, id DESC LIMIT 10"
     ).fetchall()
     st.markdown("**Recent portfolio exits**")
-    st.dataframe(
-        [{"Date": row["date"], "Details": row["notes"]} for row in exits],
-        use_container_width=True,
-    ) if exits else st.caption("No recent portfolio exits recorded.")
+    if exits:
+        exit_data = [{"Date": row["date"], "Details": row["notes"]} for row in exits]
+        st.dataframe(exit_data, use_container_width=True)
+    else:
+        st.caption("No recent portfolio exits recorded.")
 
 
 def main() -> None:
