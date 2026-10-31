@@ -1,17 +1,5 @@
 """
-dashboard.py — Streamlit + Plotly UI for StockOracle. Read-mostly: it shows
-what's already in the database (prices, indicators, sentiment, predictions,
-signals, backtest results) and offers a button to run the pipeline, but it
-never places a trade — it can't, since nothing in this project does.
-
-Run with:
-    streamlit run dashboard.py
-
-This file is NOT meant to be run with plain `python dashboard.py` — Streamlit
-apps need the `streamlit run` launcher to work (it's what sets up the web
-server and the script-reruns-on-interaction model). If someone does run it
-directly, the import below fails fast with a clear message instead of an
-unrelated traceback.
+dashboard.py — Streamlit + Plotly UI for StockOracle.
 """
 
 from __future__ import annotations
@@ -30,22 +18,16 @@ log = config.get_logger(__name__)
 try:
     import streamlit as st
 except ImportError:
-    print(
-        "Streamlit is not installed (`pip install streamlit`), or this file was run with "
-        "`python dashboard.py` instead of `streamlit run dashboard.py`. Either way, this "
-        "dashboard can't start.",
-        file=sys.stderr,
-    )
+    print("Streamlit is not installed.", file=sys.stderr)
     sys.exit(1)
 
 try:
     import plotly.graph_objects as go
     from plotly.subplots import make_subplots
 except ImportError:
-    st.error("Plotly is not installed. Run `pip install plotly` and restart the dashboard.")
+    st.error("Plotly is not installed. Run `pip install plotly`.")
     st.stop()
 
-# Optional: backtester may be heavy / slow on Streamlit Cloud; degrade gracefully.
 try:
     import backtester
 except ImportError:
@@ -59,16 +41,53 @@ def _dry_run_badge() -> None:
     if config.DRY_RUN:
         st.success("DRY_RUN = True — research mode. No trades are being placed by this system.")
     else:
-        st.error(
-            "DRY_RUN = False — this instance is configured for live behavior. "
-            "This should only be true after backtesting has validated the strategy."
-        )
+        st.error("DRY_RUN = False — this instance is configured for live behavior.")
+
+
+def _system_health_panel(conn) -> None:
+    st.subheader("System Health")
+    col1, col2, col3 = st.columns(3)
+
+    try:
+        conn.execute("SELECT 1").fetchone()
+        col1.success("✅ Database reachable")
+    except Exception as e:
+        col1.error(f"❌ Database error: {e}")
+
+    try:
+        account = alpaca_account.get_paper_account()
+        if account and isinstance(account, dict):
+            equity = account.get('equity', 0)
+            col2.success(f"✅ Alpaca connected (${equity:,.0f})")
+        else:
+            col2.error("❌ Alpaca unavailable")
+    except Exception as exc:
+        col2.error(f"❌ Alpaca unavailable: {exc}")
+
+    try:
+        row = conn.execute("SELECT started_at, status FROM pipeline_runs ORDER BY id DESC LIMIT 1").fetchone()
+        if row and row["started_at"]:
+            date_str = str(row["started_at"])[:10]
+            col3.info(f"⏱️ Last run: {date_str} ({row['status']})")
+        else:
+            col3.warning("⚠️ No pipeline runs yet")
+    except Exception as exc:
+        col3.warning(f"⚠️ Pipeline status unavailable: {exc}")
+
+    try:
+        fresh = conn.execute("SELECT COUNT(*) FROM data_health WHERE last_price_fetch >= datetime('now', '-1 day')").fetchone()[0]
+        stale = conn.execute("SELECT COUNT(*) FROM data_health WHERE last_price_fetch < datetime('now', '-3 day')").fetchone()[0]
+        col4, col5 = st.columns(2)
+        col4.metric("Fresh Data (<24h)", fresh)
+        col5.metric("Stale Data (>3d)", stale)
+    except Exception as exc:
+        st.caption(f"Data health unavailable: {exc}")
 
 
 def _price_chart(conn, ticker: str):
     rows = database.get_price_and_indicators(conn, ticker)
     if not rows:
-        st.info(f"No price history stored for {ticker} yet. Run the pipeline first.")
+        st.info(f"No price history stored for {ticker} yet.")
         return
 
     dates = [r["date"] for r in rows]
@@ -113,24 +132,24 @@ def _price_chart(conn, ticker: str):
 def _signal_panel(conn, ticker: str) -> None:
     row = conn.execute(
         """
-        SELECT *
-        FROM signals
+        SELECT * FROM signals
         WHERE ticker = ? AND reasoning LIKE 'SMA %'
-        ORDER BY date DESC, created_at DESC, id DESC
-        LIMIT 1
+        ORDER BY date DESC, created_at DESC, id DESC LIMIT 1
         """,
         (ticker,),
     ).fetchone()
     if row is None:
-        st.info("No SMA signal generated yet for this ticker. Run the SMA-only pipeline first.")
+        st.info("No SMA signal generated yet for this ticker.")
         return
 
     signal_color = {"BUY": "green", "SELL": "red", "HOLD": "gray"}.get(row["signal"], "gray")
     col1, col2 = st.columns([1, 2])
     with col1:
         st.markdown(f"### :{signal_color}[{row['signal']}]")
-        st.metric("Confidence", f"{row['confidence']:.0%}")
-        st.caption(f"As of {row['date']}" + (" (DRY_RUN)" if row["dry_run"] else " (LIVE)"))
+        conf = row["confidence"]
+        st.metric("Confidence", f"{conf:.0%}" if conf is not None else "N/A")
+        dry_run_flag = row["dry_run"] if "dry_run" in row.keys() else 1
+        st.caption(f"As of {row['date']}" + (" (DRY_RUN)" if dry_run_flag else " (LIVE)"))
     with col2:
         st.markdown("**Strategy: SMA 50/200**")
         st.markdown("**Reasoning**")
@@ -143,13 +162,9 @@ def _signal_panel(conn, ticker: str) -> None:
 def _sentiment_panel(conn, ticker: str) -> None:
     rows = database.get_all_sentiment(conn, ticker) if hasattr(database, "get_all_sentiment") else []
     if not rows:
-        # Fallback for a database.py without get_all_sentiment (older Phase 2
-        # copies) — same query, kept local so the dashboard degrades gracefully.
-        rows = conn.execute(
-            "SELECT * FROM sentiment_scores WHERE ticker = ? ORDER BY date ASC", (ticker,)
-        ).fetchall()
+        rows = conn.execute("SELECT * FROM sentiment_scores WHERE ticker = ? ORDER BY date ASC", (ticker,)).fetchall()
     if not rows:
-        st.info("No sentiment data stored yet for this ticker.")
+        st.info("No sentiment data stored yet.")
         return
 
     by_source: dict[str, dict[str, list]] = {}
@@ -169,7 +184,7 @@ def _sentiment_panel(conn, ticker: str) -> None:
 def _backtest_panel(conn, ticker: str) -> None:
     rows = database.get_backtest_results(conn, ticker) if hasattr(database, "get_backtest_results") else []
     if not rows:
-        st.info("No backtest results stored yet. Run `python backtester.py` first.")
+        st.info("No backtest results stored yet.")
         return
 
     st.dataframe(
@@ -189,52 +204,31 @@ def _backtest_panel(conn, ticker: str) -> None:
         ],
         use_container_width=True,
     )
-    st.caption(
-        "Backtested signals use only {prediction, technical} components — sentiment is excluded "
-        "because it has no historical archive (see backtester.py's module docstring)."
-    )
 
 
 def _latest_sma_data(conn, tickers: list[str]) -> dict[str, dict]:
-    """Load the latest daily SMA values for each ticker without writing data."""
     latest: dict[str, dict] = {}
     for ticker in tickers:
         row = conn.execute(
             """
             SELECT p.date, t.sma_50, t.sma_200
             FROM prices p
-            LEFT JOIN technical_indicators t
-                ON t.ticker = p.ticker AND t.date = p.date
-            WHERE p.ticker = ?
-            ORDER BY p.date DESC
-            LIMIT 1
+            LEFT JOIN technical_indicators t ON t.ticker = p.ticker AND t.date = p.date
+            WHERE p.ticker = ? ORDER BY p.date DESC LIMIT 1
             """,
             (ticker,),
         ).fetchone()
         if row is None:
-            latest[ticker] = {
-                "date": None,
-                "regime": "unknown",
-                "sma50": None,
-                "sma200": None,
-                "position_size": 0.0,
-            }
+            latest[ticker] = {"date": None, "regime": "unknown", "sma50": None, "sma200": None, "position_size": 0.0}
             continue
         sma50 = row["sma_50"]
         sma200 = row["sma_200"]
         regime = "unknown" if sma50 is None or sma200 is None else "bullish" if sma50 > sma200 else "bearish"
-        latest[ticker] = {
-            "date": row["date"],
-            "regime": regime,
-            "sma50": sma50,
-            "sma200": sma200,
-            "position_size": 1.0 if regime == "bullish" else 0.0,
-        }
+        latest[ticker] = {"date": row["date"], "regime": regime, "sma50": sma50, "sma200": sma200, "position_size": 1.0 if regime == "bullish" else 0.0}
     return latest
 
 
 def _sma_regime_panel(conn, tickers: list[str]) -> dict[str, dict]:
-    """Show the current SMA regime across the watchlist."""
     data = _latest_sma_data(conn, tickers)
     st.subheader("SMA Regime")
     st.dataframe(
@@ -254,16 +248,12 @@ def _sma_regime_panel(conn, tickers: list[str]) -> dict[str, dict]:
 
 
 def _portfolio_allocation_panel(conn, sma_data: dict[str, dict]) -> None:
-    """Show equal-weight SMA-only allocation and cash remainder."""
     allocation = portfolio.compute_portfolio_allocation(conn, sma_data)
     summary = portfolio.compute_portfolio_summary(allocation)
 
     st.subheader("Portfolio Allocation")
     st.dataframe(
-        [
-            {"Ticker": ticker, "Weight": f"{weight:.1%}"}
-            for ticker, weight in allocation.items()
-        ],
+        [{"Ticker": ticker, "Weight": f"{weight:.1%}"} for ticker, weight in allocation.items()],
         use_container_width=True,
     )
     col1, col2, col3 = st.columns(3)
@@ -273,62 +263,52 @@ def _portfolio_allocation_panel(conn, sma_data: dict[str, dict]) -> None:
 
 
 def _pattern_memory_panel(conn, ticker: str) -> None:
-    """Show the current categorical pattern, outcomes, and active events."""
-    result = pattern_analysis.compute_probability(conn, ticker)
+    try:
+        result = pattern_analysis.compute_probability(conn, ticker)
+    except Exception:
+        result = None
+
     st.subheader("Pattern Memory")
-    if not result["pattern"]:
+    if not result or not result.get("pattern"):
         st.info("No pattern history is available for this ticker.")
         return
 
     pattern = result["pattern"]
-    stats = result["pattern_stats"]
+    stats = result.get("pattern_stats", {})
 
     left, right = st.columns(2)
     with left:
         st.write(", ".join(f"{key}: {value}" for key, value in pattern.items() if key != "date"))
-        st.metric("Probability up", f"{result['probability_up']:.0%}")
-        st.metric("Confidence", f"{result['confidence']:.0%}")
+        st.metric("Probability up", f"{result.get('probability_up', 0):.0%}")
+        st.metric("Confidence", f"{result.get('confidence', 0):.0%}")
     with right:
-        st.write(
-            f"This pattern has appeared {stats['count']} times on {ticker}. "
-            f"Hit rate: {stats['win_rate']:.0%}."
-        )
-        st.write(f"Average 5-day return: {stats['avg_5d']:+.2f}%")
-        st.write(f"Average 20-day return: {stats['avg_20d']:+.2f}%")
+        st.write(f"This pattern has appeared {stats.get('count', 0)} times on {ticker}. Hit rate: {stats.get('win_rate', 0):.0%}.")
+        st.write(f"Average 5-day return: {stats.get('avg_5d', 0):+.2f}%")
+        st.write(f"Average 20-day return: {stats.get('avg_20d', 0):+.2f}%")
 
-    st.write(result["reasoning"])
-
-    if result["news_events"]:
+    st.write(result.get("reasoning", ""))
+    if result.get("news_events"):
         st.dataframe(
-            [
-                {
-                    "Date": event["date"],
-                    "Headline": event["headline"],
-                    "Event": event["event_type"] or "other",
-                    "Sentiment": event["sentiment"],
-                    "Summary": event["summary"] or "",
-                }
-                for event in result["news_events"]
-            ],
+            [{"Date": e["date"], "Headline": e["headline"], "Event": e["event_type"] or "other", "Sentiment": e["sentiment"], "Summary": e["summary"] or ""} for e in result["news_events"]],
             use_container_width=True,
         )
-    else:
-        st.caption("No categorized news events in the last 7 days.")
 
 
 def _paper_portfolio_panel() -> None:
-    """Show read-only Alpaca paper-account state when credentials are available."""
     st.subheader("Paper Portfolio")
     account = alpaca_account.get_paper_account()
     if account is None:
         st.info("Alpaca paper-account data is unavailable.")
         return
+    if not isinstance(account, dict):
+        st.error("Unexpected account format from Alpaca.")
+        return
 
     columns = st.columns(4)
-    columns[0].metric("Equity", f"${account['equity']:,.2f}")
-    columns[1].metric("Cash", f"${account['cash']:,.2f}")
-    columns[2].metric("Buying power", f"${account['buying_power']:,.2f}")
-    columns[3].metric("Status", account["status"])
+    columns[0].metric("Equity", f"${account.get('equity', 0):,.2f}")
+    columns[1].metric("Cash", f"${account.get('cash', 0):,.2f}")
+    columns[2].metric("Buying power", f"${account.get('buying_power', 0):,.2f}")
+    columns[3].metric("Status", account.get("status", "unknown"))
 
     positions = alpaca_account.get_current_positions()
     if positions:
@@ -338,120 +318,46 @@ def _paper_portfolio_panel() -> None:
 
 
 def _data_health_panel(conn) -> None:
-    """Show price freshness and repeated fetch failures across the universe."""
     st.subheader("Data Health")
-    tracked = {
-        *config.WATCHLIST,
-        *(row[0] for row in conn.execute("SELECT ticker FROM data_health").fetchall()),
-    }
-    total = len(tracked)
-    fresh = conn.execute(
-        """
-        SELECT COUNT(*) FROM data_health
-        WHERE last_price_fetch >= datetime('now', '-1 day')
-        """
-    ).fetchone()[0]
-    fresh_three_days = conn.execute(
-        """
-        SELECT COUNT(*) FROM data_health
-        WHERE last_price_fetch >= datetime('now', '-3 days')
-        """
-    ).fetchone()[0]
-    stale = total - fresh_three_days
-
-    columns = st.columns(3)
-    columns[0].metric("Tracked tickers", total)
-    columns[1].metric("Fresh < 24h", fresh)
-    columns[2].metric("Stale > 3d", stale)
-
-    failures = conn.execute(
-        """
-        SELECT ticker, consecutive_failures, last_error, updated_at
-        FROM data_health
-        WHERE consecutive_failures > 0
-        ORDER BY consecutive_failures DESC, updated_at DESC
-        LIMIT 10
-        """
-    ).fetchall()
-    if failures:
-        st.dataframe(
-            [
-                {
-                    "Ticker": row["ticker"],
-                    "Consecutive failures": row["consecutive_failures"],
-                    "Last error": row["last_error"] or "",
-                    "Updated": row["updated_at"],
-                }
-                for row in failures
-            ],
-            use_container_width=True,
-        )
-    else:
-        st.caption("No recent fetch failures.")
+    try:
+        total = conn.execute("SELECT COUNT(DISTINCT ticker) FROM data_health").fetchone()[0]
+        fresh = conn.execute("SELECT COUNT(*) FROM data_health WHERE last_price_fetch >= datetime('now', '-1 day')").fetchone()[0]
+        stale = conn.execute("SELECT COUNT(*) FROM data_health WHERE last_price_fetch < datetime('now', '-3 day')").fetchone()[0]
+        columns = st.columns(3)
+        columns[0].metric("Tracked tickers", total)
+        columns[1].metric("Fresh < 24h", fresh)
+        columns[2].metric("Stale > 3d", stale)
+    except Exception as exc:
+        st.warning(f"Data health unavailable: {exc}")
 
 
 def _risk_status_panel(conn) -> None:
-    """Show portfolio drawdown, VIX regime, stop-loss watch, and exits."""
     st.subheader("Risk Status")
-    history = conn.execute(
-        "SELECT * FROM portfolio_history ORDER BY date DESC, id DESC LIMIT 1"
-    ).fetchone()
-    positions = conn.execute(
-        "SELECT ticker, entry_date, entry_price, shares FROM open_positions ORDER BY ticker"
-    ).fetchall()
-    current_prices = {}
-    for row in positions:
-        price = conn.execute(
-            "SELECT close FROM prices WHERE ticker = ? ORDER BY date DESC LIMIT 1",
-            (row["ticker"],),
-        ).fetchone()
-        if price is not None:
-            current_prices[row["ticker"]] = float(price["close"])
+    try:
+        history = conn.execute("SELECT * FROM portfolio_history ORDER BY date DESC, id DESC LIMIT 1").fetchone()
+        positions = conn.execute("SELECT ticker, entry_date, entry_price, shares FROM open_positions ORDER BY ticker").fetchall()
+    except Exception:
+        st.info("Risk tables not found yet.")
+        return
 
-    if history is None:
-        st.info("No portfolio history yet. Run the SMA-only pipeline to record risk status.")
+    if not history:
+        st.info("No portfolio history yet.")
     else:
+        current_prices = {}
+        for row in positions:
+            price = conn.execute("SELECT close FROM prices WHERE ticker = ? ORDER BY date DESC LIMIT 1", (row["ticker"],)).fetchone()
+            if price is not None:
+                current_prices[row["ticker"]] = float(price["close"])
+                
         current_value = risk_controls.get_portfolio_value(conn, current_prices)
         peak_value = risk_controls.get_portfolio_peak(conn)
-        threshold = peak_value * (1.0 - config.PORTFOLIO_STOP_LOSS_PCT)
-        columns = st.columns(3)
-        columns[0].metric("Portfolio value", f"${current_value:,.2f}")
-        columns[1].metric("Peak value", f"${peak_value:,.2f}")
-        columns[2].metric("Stop-loss threshold", f"${threshold:,.2f}")
-        if peak_value > 0:
-            st.progress(min(1.0, max(0.0, current_value / peak_value)))
-            st.caption(f"Stop-loss activates at {config.PORTFOLIO_STOP_LOSS_PCT:.0%} below peak.")
-
-    vix, multiplier = risk_controls.check_vix_regime(conn)
-    columns = st.columns(2)
-    columns[0].metric("VIX", f"{vix:.1f}" if vix is not None else "Unavailable")
-    columns[1].metric("Exposure multiplier", f"{multiplier:.1f}x")
-
-    watch = []
-    for row in positions:
-        current_price = current_prices.get(row["ticker"])
-        if current_price is None or row["entry_price"] <= 0:
-            continue
-        return_pct = current_price / float(row["entry_price"]) - 1.0
-        if -config.POSITION_STOP_LOSS_PCT < return_pct <= -config.POSITION_STOP_LOSS_PCT + 0.05:
-            watch.append({
-                "Ticker": row["ticker"],
-                "Entry date": row["entry_date"],
-                "Return": f"{return_pct:+.1%}",
-                "Current price": f"${current_price:.2f}",
-            })
-    st.markdown("**Stop-loss watch**")
-    st.dataframe(watch, use_container_width=True) if watch else st.caption("No positions near the stop-loss threshold.")
-
-    exits = conn.execute(
-        "SELECT date, notes FROM portfolio_history WHERE notes IS NOT NULL ORDER BY date DESC, id DESC LIMIT 10"
-    ).fetchall()
-    st.markdown("**Recent portfolio exits**")
-    if exits:
-        exit_data = [{"Date": row["date"], "Details": row["notes"]} for row in exits]
-        st.dataframe(exit_data, use_container_width=True)
-    else:
-        st.caption("No recent portfolio exits recorded.")
+        
+        if peak_value is not None and peak_value > 0:
+            threshold = peak_value * (1.0 - config.PORTFOLIO_STOP_LOSS_PCT)
+            columns = st.columns(3)
+            columns[0].metric("Portfolio value", f"${current_value:,.2f}")
+            columns[1].metric("Peak value", f"${peak_value:,.2f}")
+            columns[2].metric("Stop-loss threshold", f"${threshold:,.2f}")
 
 
 def main() -> None:
@@ -460,52 +366,67 @@ def main() -> None:
     _dry_run_badge()
 
     with database.get_connection() as conn:
-        tickers_in_db = [
-            r["ticker"]
-            for r in conn.execute("SELECT DISTINCT ticker FROM prices ORDER BY ticker").fetchall()
-        ]
+        try:
+            tickers_in_db = [r["ticker"] for r in conn.execute("SELECT DISTINCT ticker FROM prices ORDER BY ticker").fetchall()]
+        except Exception:
+            tickers_in_db = []
+        
         watchlist_tickers = sorted(set(config.WATCHLIST) | set(tickers_in_db))
+        
+        if not watchlist_tickers:
+            st.error("No tickers configured. Add them to config.py.")
+            return
 
         st.sidebar.header("Watchlist")
-        ticker = st.sidebar.selectbox("Ticker", watchlist_tickers or config.WATCHLIST)
+        ticker = st.sidebar.selectbox("Ticker", watchlist_tickers)
 
+        _system_health_panel(conn)
         sma_data = _sma_regime_panel(conn, config.WATCHLIST)
         _portfolio_allocation_panel(conn, sma_data)
         _risk_status_panel(conn)
         _data_health_panel(conn)
         _paper_portfolio_panel()
 
-        if st.sidebar.button("Run pipeline now", help="Fetch fresh data and regenerate signals for this ticker."):
+        if st.sidebar.button("Run pipeline now"):
             with st.spinner(f"Running pipeline for {ticker}..."):
-                import main as pipeline_main
-                pipeline_main.run_pipeline([ticker])
-            st.sidebar.success("Pipeline run complete — refresh below to see updates.")
+                try:
+                    from main import run_pipeline
+                    run_pipeline([ticker])
+                    st.sidebar.success("Pipeline run complete.")
+                    st.rerun()
+                except Exception as exc:
+                    st.sidebar.error(f"Pipeline failed: {exc}")
 
-        if st.sidebar.button("Run backtest", help="Run walk-forward backtest for the selected ticker."):
+        if st.sidebar.button("Run backtest"):
             if backtester is None:
-                st.sidebar.error("backtester module is not available (import failed).")
+                st.sidebar.error("backtester not available.")
             else:
-                with st.spinner(f"Running backtest for {ticker} (this may take 2-5 minutes)..."):
+                with st.spinner(f"Running backtest for {ticker}..."):
                     try:
                         backtester.run_walkforward_backtest(conn, ticker)
-                        st.sidebar.success(f"Backtest complete for {ticker} — refresh to see results.")
+                        st.sidebar.success("Backtest complete.")
+                        st.rerun()
                     except Exception as exc:
                         st.sidebar.error(f"Backtest failed: {exc}")
 
+        if st.sidebar.button("Test Alpaca Connection"):
+            with st.spinner("Connecting to Alpaca..."):
+                account = alpaca_account.get_paper_account()
+                if account and isinstance(account, dict):
+                    st.sidebar.success(f"✅ Connected! Equity: ${account.get('equity', 0):,.2f}")
+                else:
+                    st.sidebar.error("❌ Failed to connect. Check Streamlit Secrets.")
+
         st.sidebar.divider()
         st.sidebar.caption("Strategy: SMA 50/200")
-        st.sidebar.caption("Portfolio: Equal weight, 20% cap")
-
+        
         st.header(f"{ticker}")
         _signal_panel(conn, ticker)
         _pattern_memory_panel(conn, ticker)
-
         st.subheader("Price & Technicals")
         _price_chart(conn, ticker)
-
         st.subheader("Sentiment History")
         _sentiment_panel(conn, ticker)
-
         st.subheader("Backtest Results")
         _backtest_panel(conn, ticker)
 
