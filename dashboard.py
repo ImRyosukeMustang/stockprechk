@@ -408,6 +408,7 @@ def main() -> None:
                         st.rerun()
                     except Exception as exc:
                         st.sidebar.error(f"Backtest failed: {exc}")
+      
 
         if st.sidebar.button("Test Alpaca Connection"):
             with st.spinner("Connecting to Alpaca..."):
