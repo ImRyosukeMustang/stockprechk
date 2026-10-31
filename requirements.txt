@@ -22,3 +22,6 @@ openai
 apscheduler
 streamlit
 plotly
+
+# --- Trading & Data ---
+alpaca-py
