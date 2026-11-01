@@ -36,6 +36,8 @@ FINNHUB_ENABLED: bool = True
 FINNHUB_MAX_TICKERS_PER_RUN: int = 50
 FUNDAMENTALS_REFRESH_DAYS: int = 7
 NEWS_MAX_TICKERS_PER_RUN: int = 50
+FMP_MAX_TICKERS_PER_RUN: int = 60
+ALPHAVANTAGE_MAX_TICKERS_PER_RUN: int = 20
 
 # ---------------------------------------------------------------------------
 # SAFETY SWITCH — the whole project must respect this. No module should ever
@@ -69,6 +71,9 @@ NEWSAPI_KEY: str | None = _get_secret("NEWSAPI_KEY")
 REDDIT_CLIENT_ID: str | None = _get_secret("REDDIT_CLIENT_ID")
 REDDIT_CLIENT_SECRET: str | None = _get_secret("REDDIT_CLIENT_SECRET")
 REDDIT_USER_AGENT: str = _get_secret("REDDIT_USER_AGENT", "StockOracle/0.1")
+BIGDATA_API_KEY: str | None = _get_secret("BIGDATA_API_KEY")
+FMP_API_KEY: str | None = _get_secret("FMP_API_KEY")
+ALPHAVANTAGE_API_KEY: str | None = _get_secret("ALPHAVANTAGE_API_KEY")
 
 # ---------------------------------------------------------------------------
 # LLM model selection
@@ -78,11 +83,9 @@ LLM_MODEL_DEEP: str = "gpt-4o"         # full thesis writing, deep reasoning
 
 # ---------------------------------------------------------------------------
 # ---------------------------------------------------------------------------
-# Watchlist — load the expanded universe, then S&P 500, then a small fallback.
+# Watchlist — strictly the S&P 500, with a small fallback if the file is absent.
 # ---------------------------------------------------------------------------
-_TICKERS_FILE = BASE_DIR / "universe_tickers.txt"
-if not _TICKERS_FILE.exists():
-    _TICKERS_FILE = BASE_DIR / "sp500_tickers.txt"
+_TICKERS_FILE = BASE_DIR / "sp500_tickers.txt"
 if _TICKERS_FILE.exists():
     WATCHLIST: list[str] = [
         line.strip().upper()
@@ -209,6 +212,9 @@ for _key_name, _key_val in (
     ("NEWSAPI_KEY", NEWSAPI_KEY),
     ("REDDIT_CLIENT_ID", REDDIT_CLIENT_ID),
     ("REDDIT_CLIENT_SECRET", REDDIT_CLIENT_SECRET),
+    ("BIGDATA_API_KEY", BIGDATA_API_KEY),
+    ("FMP_API_KEY", FMP_API_KEY),
+    ("ALPHAVANTAGE_API_KEY", ALPHAVANTAGE_API_KEY),
 ):
     if not _key_val:
         _log.warning("%s is not set — features depending on it will be skipped.", _key_name)

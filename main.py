@@ -25,6 +25,8 @@ import config
 import data_fetcher
 import database
 import decision_engine
+import alphavantage_fetcher
+import fmp_fetcher
 import journal
 import macro_fetcher
 import predictor
@@ -66,6 +68,22 @@ def _latest_prices(conn, tickers: set[str]) -> dict[str, float]:
         if row is not None and row["close"] is not None:
             prices[ticker] = float(row["close"])
     return prices
+
+
+def _signal_strength(signal: dict) -> float:
+    """Return normalized SMA spread for ranking bullish pipeline candidates."""
+    sma50, sma200 = signal.get("sma50"), signal.get("sma200")
+    if sma50 is not None and sma200:
+        return (float(sma50) - float(sma200)) / float(sma200)
+    return float(signal.get("strength", 0.0) or 0.0)
+
+
+def _rank_bullish_tickers(signals: dict[str, dict]) -> list[str]:
+    return sorted(
+        (ticker for ticker, signal in signals.items() if signal.get("regime") == "bullish"),
+        key=lambda ticker: _signal_strength(signals[ticker]),
+        reverse=True,
+    )
 
 
 def run_pipeline(tickers: list[str] | None = None) -> dict[str, dict[str, int]]:
@@ -224,20 +242,21 @@ def run_pipeline_sma_only(
             if processed < len(tickers):
                 time.sleep(5)
 
-        news_tickers = [
-            ticker for ticker in sorted(
-                signals,
-                key=lambda name: signals[name].get("strength", 0.0),
-                reverse=True,
-            )
-            if signals[ticker].get("regime") == "bullish"
-        ][: config.NEWS_MAX_TICKERS_PER_RUN]
+        ranked_tickers = _rank_bullish_tickers(signals)
+        news_tickers = ranked_tickers[: config.NEWS_MAX_TICKERS_PER_RUN]
         log.info("Fetching daily news for %d top-trend ticker(s)", len(news_tickers))
         for ticker in news_tickers:
             company_name = COMPANY_NAMES.get(ticker.upper())
             data_fetcher.fetch_news_for_ticker(conn, ticker, company_name)
             if config.FINNHUB_ENABLED:
                 data_fetcher.fetch_finnhub_news_for_ticker(conn, ticker)
+
+        alpha_tickers = ranked_tickers[: config.ALPHAVANTAGE_MAX_TICKERS_PER_RUN]
+        for ticker in alpha_tickers:
+            try:
+                alphavantage_fetcher.fetch_news_sentiment(conn, ticker)
+            except Exception as exc:
+                log.warning("Alpha Vantage fetch failed for %s; continuing: %s", ticker, exc)
 
         if refresh_weekly:
             log.info("Refreshing weekly fundamentals and company profiles")
@@ -246,6 +265,14 @@ def run_pipeline_sma_only(
                 data_fetcher.fetch_fundamentals(conn, ticker)
                 if config.FINNHUB_ENABLED:
                     data_fetcher.fetch_finnhub_weekly_extras(conn, ticker)
+
+            fmp_tickers = ranked_tickers[: config.FMP_MAX_TICKERS_PER_RUN]
+            log.info("Refreshing FMP data for %d top portfolio candidates", len(fmp_tickers))
+            for ticker in fmp_tickers:
+                try:
+                    fmp_fetcher.fetch_all_for_ticker(conn, ticker)
+                except Exception as exc:
+                    log.warning("FMP fetch failed for %s; continuing: %s", ticker, exc)
 
         log.info("Pipeline complete: %d/%d tickers succeeded", successful_count, len(tickers))
         if config.FINNHUB_ENABLED:

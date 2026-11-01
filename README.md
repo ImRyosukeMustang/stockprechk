@@ -37,3 +37,18 @@ python -m streamlit run streamlit_app.py
 The `streamlit_app.py` entry point delegates to `dashboard.py`. API credentials
 are optional; configure them in the environment or a local `.env` file. Never
 commit API keys.
+
+## Streamlit Cloud API secrets
+
+In Streamlit Cloud, open the app's **Settings > Secrets** and add the keys
+needed by the enabled integrations:
+
+```toml
+BIGDATA_API_KEY = "your-bigdata-api-key"
+FMP_API_KEY = "your-fmp-api-key"
+ALPHAVANTAGE_API_KEY = "your-alpha-vantage-api-key"
+```
+
+The same names can be set as environment variables for local runs. All three
+integrations are optional: without a key, the chatbot or data source reports
+that it is unavailable and the rest of the pipeline continues.

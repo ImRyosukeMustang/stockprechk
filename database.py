@@ -120,6 +120,34 @@ CREATE TABLE IF NOT EXISTS fundamentals (
     fetched_at  TEXT    NOT NULL DEFAULT (datetime('now')),
     UNIQUE(ticker, date)
 );
+
+CREATE TABLE IF NOT EXISTS company_profiles (
+    ticker TEXT PRIMARY KEY,
+    profile_json TEXT NOT NULL,
+    fetched_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE TABLE IF NOT EXISTS financial_statements (
+    ticker TEXT NOT NULL,
+    statement_type TEXT NOT NULL,
+    report_date TEXT NOT NULL,
+    period TEXT NOT NULL DEFAULT '',
+    raw_json TEXT NOT NULL,
+    fetched_at TEXT NOT NULL DEFAULT (datetime('now')),
+    UNIQUE(ticker, statement_type, report_date, period)
+);
+
+CREATE INDEX IF NOT EXISTS idx_financial_statements_ticker_date
+    ON financial_statements(ticker, report_date);
+
+CREATE TABLE IF NOT EXISTS key_metrics (
+    ticker TEXT NOT NULL,
+    report_date TEXT NOT NULL,
+    period TEXT NOT NULL DEFAULT '',
+    raw_json TEXT NOT NULL,
+    fetched_at TEXT NOT NULL DEFAULT (datetime('now')),
+    UNIQUE(ticker, report_date, period)
+);
  
 CREATE TABLE IF NOT EXISTS sentiment_scores (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,

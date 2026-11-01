@@ -12,6 +12,7 @@ import alpaca_account
 import pattern_analysis
 import portfolio
 import risk_controls
+import bigdata_chat
 
 log = config.get_logger(__name__)
 
@@ -294,6 +295,54 @@ def _pattern_memory_panel(conn, ticker: str) -> None:
         )
 
 
+def _chatbot_panel(conn, ticker: str) -> None:
+    st.subheader("BigData Research Chat")
+    history_key = f"bigdata_chat_history_{ticker}"
+    history = st.session_state.setdefault(history_key, [])
+
+    for message in history:
+        with st.chat_message(message["role"]):
+            st.markdown(message["content"])
+            for citation in message.get("citations", []):
+                if isinstance(citation, dict):
+                    title = citation.get("title") or citation.get("name") or citation.get("url") or "Source"
+                    url = citation.get("url") or citation.get("href")
+                    st.markdown(f"- [{title}]({url})" if url else f"- {title}")
+                else:
+                    st.markdown(f"- {citation}")
+
+    prompt = st.chat_input(f"Ask a financial question about {ticker}")
+    if not prompt:
+        return
+
+    history.append({"role": "user", "content": prompt})
+    conversation = "\n".join(
+        f"{message['role']}: {message['content']}" for message in history[-9:]
+    )
+    with st.chat_message("user"):
+        st.markdown(prompt)
+    with st.chat_message("assistant"):
+        with st.spinner("Researching..."):
+            result = bigdata_chat.ask_bigdata(
+                f"Ticker context: {ticker}\n\nConversation:\n{conversation}"
+            )
+        answer = result.get("answer")
+        if answer:
+            st.markdown(answer)
+        else:
+            answer = result.get("error") or "The research agent did not return an answer."
+            st.warning(answer)
+        citations = result.get("citations", [])
+        for citation in citations:
+            if isinstance(citation, dict):
+                title = citation.get("title") or citation.get("name") or citation.get("url") or "Source"
+                url = citation.get("url") or citation.get("href")
+                st.markdown(f"- [{title}]({url})" if url else f"- {title}")
+            else:
+                st.markdown(f"- {citation}")
+    history.append({"role": "assistant", "content": answer, "citations": citations})
+
+
 def _paper_portfolio_panel() -> None:
     st.subheader("Paper Portfolio")
     account = alpaca_account.get_paper_account()
@@ -424,6 +473,7 @@ def main() -> None:
         st.header(f"{ticker}")
         _signal_panel(conn, ticker)
         _pattern_memory_panel(conn, ticker)
+        _chatbot_panel(conn, ticker)
         st.subheader("Price & Technicals")
         _price_chart(conn, ticker)
         st.subheader("Sentiment History")
