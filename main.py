@@ -119,6 +119,7 @@ def run_pipeline(tickers: list[str] | None = None) -> dict[str, dict[str, int]]:
                         company_name = COMPANY_NAMES.get(ticker.upper())
                         log.info("--- %s (%d/%d) ---", ticker, index, len(tickers))
                         fetch_counts = data_fetcher.fetch_all_for_ticker(conn, ticker, company_name)
+                        conn.commit()
                         if config.FINNHUB_ENABLED and ticker in finnhub_tickers:
                             fetch_counts.update(data_fetcher.fetch_all_finnhub_for_ticker(conn, ticker))
 

@@ -127,7 +127,7 @@ def _price_chart(conn, ticker: str):
         fig.add_trace(go.Scatter(x=dates, y=macd_signal, name="Signal", line=dict(color="orange")), row=3, col=1)
 
     fig.update_layout(height=750, showlegend=True, margin=dict(t=40, b=20))
-    st.plotly_chart(fig, use_container_width=True)
+    st.plotly_chart(fig, width="stretch")
 
 
 def _signal_panel(conn, ticker: str) -> None:
@@ -179,7 +179,7 @@ def _sentiment_panel(conn, ticker: str) -> None:
         fig.add_trace(go.Scatter(x=series["dates"], y=series["scores"], name=source, mode="lines+markers"))
     fig.add_hline(y=0, line_color="gray", opacity=0.4)
     fig.update_layout(height=300, yaxis_title="Sentiment (-1 to 1)", margin=dict(t=20, b=20))
-    st.plotly_chart(fig, use_container_width=True)
+    st.plotly_chart(fig, width="stretch")
 
 
 def _backtest_panel(conn, ticker: str) -> None:
@@ -203,7 +203,7 @@ def _backtest_panel(conn, ticker: str) -> None:
             }
             for r in rows
         ],
-        use_container_width=True,
+        width="stretch",
     )
 
 
@@ -243,7 +243,7 @@ def _sma_regime_panel(conn, tickers: list[str]) -> dict[str, dict]:
             }
             for ticker, values in data.items()
         ],
-        use_container_width=True,
+        width="stretch",
     )
     return data
 
@@ -255,7 +255,7 @@ def _portfolio_allocation_panel(conn, sma_data: dict[str, dict]) -> None:
     st.subheader("Portfolio Allocation")
     st.dataframe(
         [{"Ticker": ticker, "Weight": f"{weight:.1%}"} for ticker, weight in allocation.items()],
-        use_container_width=True,
+        width="stretch",
     )
     col1, col2, col3 = st.columns(3)
     col1.metric("Total exposure", f"{summary['total_exposure']:.1%}")
@@ -291,7 +291,7 @@ def _pattern_memory_panel(conn, ticker: str) -> None:
     if result.get("news_events"):
         st.dataframe(
             [{"Date": e["date"], "Headline": e["headline"], "Event": e["event_type"] or "other", "Sentiment": e["sentiment"], "Summary": e["summary"] or ""} for e in result["news_events"]],
-            use_container_width=True,
+            width="stretch",
         )
 
 
@@ -361,7 +361,7 @@ def _paper_portfolio_panel() -> None:
 
     positions = alpaca_account.get_current_positions()
     if positions:
-        st.dataframe(positions, use_container_width=True)
+        st.dataframe(positions, width="stretch")
     else:
         st.caption("No open paper positions.")
 
